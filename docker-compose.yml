@@ -1,0 +1,75 @@
+# ─── Docker Compose for EntitlementLedger ──────────────────────────────────
+# Production-ready setup with PostgreSQL.
+#
+# Usage:
+#   cp backend/.env.example backend/.env   # Edit with real values
+#   docker compose up -d --build
+#   docker compose exec backend alembic stamp head
+#
+# Development (SQLite):
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+services:
+  # ── PostgreSQL ──
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: entitlement_ledger
+      POSTGRES_USER: ${POSTGRES_USER:-entitlement}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-entitlement}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── Backend ──
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-entitlement}:${POSTGRES_PASSWORD:-changeme}@db:5432/entitlement_ledger
+      JWT_SECRET_KEY: ${JWT_SECRET_KEY}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      SEED_DATA: "false"
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      # Razorpay (set in .env)
+      RAZORPAY_KEY_ID: ${RAZORPAY_KEY_ID:-}
+      RAZORPAY_KEY_SECRET: ${RAZORPAY_KEY_SECRET:-}
+      RAZORPAY_WEBHOOK_SECRET: ${RAZORPAY_WEBHOOK_SECRET:-}
+      # AI (optional)
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:latest}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      - ./backend:/app/backend  # Dev: hot-reload (remove in prod)
+
+  # ── Frontend (dev only — production uses built-in static from backend) ──
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    volumes:
+      - ./frontend:/app
+    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_URL: http://localhost:8000
+    profiles:
+      - dev
+
+volumes:
+  pgdata:
