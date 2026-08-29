@@ -145,10 +145,14 @@ async def list_scenarios(user: CurrentUser = Depends(get_current_user)):
 
 @router.post("/scenarios/{scenario_id}/run")
 async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current_user)):
-    """Run a scenario through the AI pipeline and create a decision."""
+    """Run a scenario through the AI pipeline and create a decision.
+
+    Evidence is fetched from the database for the authenticated user's tenant.
+    Policies are fetched from the database via the scenario's policy_ids.
+    If no evidence exists for this tenant, returns an error — never invents evidence.
+    """
     from ai.pipeline import run_pipeline
     from ai.llm_provider import is_ai_available
-    from seed_data import get_scenario_evidence, get_scenario_policies, get_last_decision_hash
 
     db = await get_db()
     try:
@@ -158,24 +162,73 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                 "status": "error",
                 "scenario_id": scenario_id,
                 "error": "No LLM provider available",
-                "message": "Start Ollama with a model, or set ANTHROPIC_API_KEY.",
-                "fallback": "Use seeded demo data instead.",
+                "message": "Start Ollama with a model, or set OPENROUTER_API_KEY.",
+                "fallback": "Configure an LLM provider to enable AI analysis.",
             }
 
-        # Check scenario exists
+        # Check scenario exists in database
         cursor = await db.execute("SELECT * FROM scenarios WHERE scenario_id = ?", (scenario_id,))
         scenario = await cursor.fetchone()
         if not scenario:
             raise HTTPException(404, f"Scenario {scenario_id} not found")
 
-        # Get evidence and policies (from seed data for scenarios)
-        evidence_records = get_scenario_evidence(scenario_id)
-        policy_records = get_scenario_policies(scenario_id)
+        # Fetch policies from database via scenario's policy_ids
+        policy_ids_raw = scenario["policy_ids"]
+        if isinstance(policy_ids_raw, str):
+            policy_ids = json.loads(policy_ids_raw)
+        else:
+            policy_ids = policy_ids_raw
+
+        policy_records = []
+        for pid in policy_ids:
+            cursor_p = await db.execute("SELECT * FROM policies WHERE policy_id = ?", (pid,))
+            p_row = await cursor_p.fetchone()
+            if p_row:
+                policy_records.append(dict(p_row)) if hasattr(p_row, 'keys') else policy_records.append({k: p_row[i] for i, k in enumerate(['policy_id', 'version', 'clause_text', 'effective_date'])})
+
+        if not policy_records:
+            return {
+                "status": "error",
+                "scenario_id": scenario_id,
+                "error": "No policies found for this scenario",
+                "message": "Scenario has no configured policies. Run system initialization first.",
+            }
+
+        # Fetch only unprocessed evidence from database for this tenant.
+        # Evidence already linked to a decision (linked_decision_ids != '[]')
+        # has already been analyzed and must not be re-processed.
+        cursor_ev = await db.execute(
+            "SELECT * FROM evidence WHERE tenant_id = ? AND linked_decision_ids = '[]'",
+            (user.tenant_id,),
+        )
+        ev_rows = await cursor_ev.fetchall()
+        evidence_records = [dict(r) if hasattr(r, 'keys') else {k: r[i] for i, k in enumerate(['evidence_id', 'tenant_id', 'source_type', 'raw_content', 'extracted_facts', 'linked_decision_ids', 'content_hash', 'version', 'created_at'])} for r in ev_rows]
+
+        # Parse JSON fields in evidence records
+        for ev in evidence_records:
+            for field in ('extracted_facts', 'linked_decision_ids'):
+                if isinstance(ev.get(field), str):
+                    try:
+                        ev[field] = json.loads(ev[field])
+                    except (json.JSONDecodeError, TypeError):
+                        ev[field] = []
 
         if not evidence_records:
-            raise HTTPException(400, f"No evidence records found for scenario {scenario_id}")
+            return {
+                "status": "error",
+                "scenario_id": scenario_id,
+                "error": "No evidence available",
+                "message": "No evidence records found for this tenant. Create evidence from Razorpay events or user uploads before running analysis.",
+            }
 
-        prev_hash = get_last_decision_hash()
+        # Get previous decision hash from database (not seed data)
+        cursor_hash = await db.execute(
+            "SELECT decision_hash FROM decisions WHERE tenant_id = ? AND decision_id != 'dec_005_tampered' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (user.tenant_id,),
+        )
+        prev_row = await cursor_hash.fetchone()
+        prev_hash = prev_row["decision_hash"] if prev_row else "genesis"
 
         try:
             result = run_pipeline(

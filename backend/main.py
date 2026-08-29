@@ -55,6 +55,10 @@ async def lifespan(app: FastAPI):
     """Initialize database and optionally seed dev data."""
     await init_db()
 
+    # Always ensure required system configuration exists (policies, scenarios).
+    # This is idempotent — safe to call on every startup.
+    await _ensure_system_config()
+
     # Production NEVER seeds demo data. Requires SEED_DATA=true explicitly.
     if ENV != "production" and (SEED_DATA or ENV == "development"):
         await _seed_dev_data()
@@ -124,16 +128,16 @@ async def _seed_dev_data():
 
         # Load scenarios
         scenarios = [
-            ("scenario_1", "Return + SLA Breach", "Platform fee, SLA penalty for late delivery, and return reserve for processed return.", "completed"),
-            ("scenario_2", "Late Delivery Only", "Platform fee and SLA penalty for delivery delay. No returns.", "completed"),
-            ("scenario_3", "Complaint Without Penalty", "Customer complaint filed but evidence does not justify additional deduction.", "completed"),
-            ("scenario_4", "Multiple Seller Decisions", "Second decision for seller_abc showing decision history.", "completed"),
-            ("scenario_5", "Tampered Decision", "Record modified after hashing, breaking the integrity chain.", "completed"),
+            ("scenario_1", "Return + SLA Breach", "Platform fee, SLA penalty for late delivery, and return reserve for processed return.", "completed", '["platform_1_1", "sla_4_2", "returns_3_1"]'),
+            ("scenario_2", "Late Delivery Only", "Platform fee and SLA penalty for delivery delay. No returns.", "completed", '["platform_1_1", "sla_4_2"]'),
+            ("scenario_3", "Complaint Without Penalty", "Customer complaint filed but evidence does not justify additional deduction.", "completed", '["platform_1_1"]'),
+            ("scenario_4", "Multiple Seller Decisions", "Second decision for seller_abc showing decision history.", "completed", '["platform_1_1"]'),
+            ("scenario_5", "Tampered Decision", "Record modified after hashing, breaking the integrity chain.", "completed", '["platform_1_1", "sla_4_2", "returns_3_1"]'),
         ]
-        for sid, name, desc, status in scenarios:
+        for sid, name, desc, status, policy_ids in scenarios:
             await db.execute(
-                "INSERT OR IGNORE INTO scenarios (scenario_id, name, description, status) VALUES (?, ?, ?, ?)",
-                (sid, name, desc, status),
+                "INSERT OR IGNORE INTO scenarios (scenario_id, name, description, status, policy_ids) VALUES (?, ?, ?, ?, ?)",
+                (sid, name, desc, status, policy_ids),
             )
 
         # Load seeded decisions (hash chain)
@@ -159,6 +163,71 @@ async def _seed_dev_data():
         await db.commit()
         logger.info("Development seed data loaded: %d policies, %d evidence, %d scenarios, %d decisions",
                      len(POLICY_RECORDS), len(EVIDENCE_RECORDS), len(scenarios), len(decisions))
+    finally:
+        await db.close()
+
+
+async def _ensure_system_config():
+    """Idempotently insert required system configuration (policies and scenarios).
+
+    These are NOT demo data — they are business rules and analysis templates
+    that the application requires to function. Safe to call on every startup.
+    """
+    from seed_data import POLICY_RECORDS
+
+    db = await get_db()
+    try:
+        # Insert policies idempotently
+        for p in POLICY_RECORDS:
+            await db.execute(
+                "INSERT OR IGNORE INTO policies (policy_id, version, clause_text, effective_date) "
+                "VALUES (?, ?, ?, ?)",
+                (p["policy_id"], p["version"], p["clause_text"], p["effective_date"]),
+            )
+
+        # Insert scenarios with policy_ids — the analysis templates
+        system_scenarios = [
+            {
+                "scenario_id": "scenario_1",
+                "name": "Return + SLA Breach",
+                "description": "Analyzes evidence for platform fee, SLA penalty for late delivery, and return reserve.",
+                "policy_ids": json.dumps(["platform_1_1", "sla_4_2", "returns_3_1"]),
+            },
+            {
+                "scenario_id": "scenario_2",
+                "name": "Late Delivery Only",
+                "description": "Analyzes evidence for platform fee and SLA penalty for delivery delay.",
+                "policy_ids": json.dumps(["platform_1_1", "sla_4_2"]),
+            },
+            {
+                "scenario_id": "scenario_3",
+                "name": "Complaint Without Penalty",
+                "description": "Analyzes evidence for platform fee only — complaint does not justify additional deduction.",
+                "policy_ids": json.dumps(["platform_1_1"]),
+            },
+            {
+                "scenario_id": "scenario_4",
+                "name": "Multiple Seller Decisions",
+                "description": "Second decision for same seller showing decision history.",
+                "policy_ids": json.dumps(["platform_1_1"]),
+            },
+            {
+                "scenario_id": "scenario_5",
+                "name": "Tampered Decision",
+                "description": "A decision where stored content was modified after hashing, breaking the integrity chain.",
+                "policy_ids": json.dumps(["platform_1_1", "sla_4_2", "returns_3_1"]),
+            },
+        ]
+        for s in system_scenarios:
+            await db.execute(
+                "INSERT OR IGNORE INTO scenarios (scenario_id, name, description, status, policy_ids) "
+                "VALUES (?, ?, ?, 'active', ?)",
+                (s["scenario_id"], s["name"], s["description"], s["policy_ids"]),
+            )
+
+        await db.commit()
+        logger.info("System configuration ensured: %d policies, %d scenarios",
+                     len(POLICY_RECORDS), len(system_scenarios))
     finally:
         await db.close()
 

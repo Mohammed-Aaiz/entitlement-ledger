@@ -115,7 +115,8 @@ CREATE TABLE IF NOT EXISTS scenarios (
     scenario_id VARCHAR(128) PRIMARY KEY,
     name VARCHAR(256) NOT NULL,
     description TEXT NOT NULL,
-    status VARCHAR(32) NOT NULL DEFAULT 'pending'
+    status VARCHAR(32) NOT NULL DEFAULT 'pending',
+    policy_ids JSONB NOT NULL DEFAULT '[]'
 );
 
 -- Razorpay events with tenant isolation
@@ -325,7 +326,8 @@ CREATE TABLE IF NOT EXISTS scenarios (
     scenario_id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT NOT NULL,
-    status TEXT NOT NULL DEFAULT 'pending'
+    status TEXT NOT NULL DEFAULT 'pending',
+    policy_ids TEXT NOT NULL DEFAULT '[]'
 );
 
 -- Razorpay events with tenant isolation
@@ -803,6 +805,7 @@ async def _sqlite_migrate(db):
         ("audit_log", "request_id", "TEXT"),
         ("audit_log", "action", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("audit_log", "entity_type", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("scenarios", "policy_ids", "TEXT NOT NULL DEFAULT '[]'"),
     ]
     for table, column, col_def in migrations:
         try:

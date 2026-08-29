@@ -99,16 +99,16 @@ async def _seed_test_data():
 
         # Load scenarios
         scenarios = [
-            ("scenario_1", "Return + SLA Breach", "Multi-source decision reconstruction", "completed"),
-            ("scenario_2", "Late Delivery Only", "SLA penalty only", "completed"),
-            ("scenario_3", "Complaint Without Penalty", "No additional deduction", "completed"),
-            ("scenario_4", "Multiple Seller Decisions", "Decision history", "completed"),
-            ("scenario_5", "Tampered Decision", "Integrity chain broken", "completed"),
+            ("scenario_1", "Return + SLA Breach", "Multi-source decision reconstruction", "completed", '["platform_1_1", "sla_4_2", "returns_3_1"]'),
+            ("scenario_2", "Late Delivery Only", "SLA penalty only", "completed", '["platform_1_1", "sla_4_2"]'),
+            ("scenario_3", "Complaint Without Penalty", "No additional deduction", "completed", '["platform_1_1"]'),
+            ("scenario_4", "Multiple Seller Decisions", "Decision history", "completed", '["platform_1_1"]'),
+            ("scenario_5", "Tampered Decision", "Integrity chain broken", "completed", '["platform_1_1", "sla_4_2", "returns_3_1"]'),
         ]
-        for sid, name, desc, status in scenarios:
+        for sid, name, desc, status, policy_ids in scenarios:
             await db.execute(
-                "INSERT OR IGNORE INTO scenarios (scenario_id, name, description, status) VALUES (?, ?, ?, ?)",
-                (sid, name, desc, status),
+                "INSERT OR IGNORE INTO scenarios (scenario_id, name, description, status, policy_ids) VALUES (?, ?, ?, ?, ?)",
+                (sid, name, desc, status, policy_ids),
             )
 
         # Load seeded decisions
