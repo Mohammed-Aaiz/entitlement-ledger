@@ -6,14 +6,16 @@ environments (where seed data is not loaded) can run scenarios.
 """
 
 revision = "0003"
-down_revision = "0002"
+down_revision = "0002_razorpay_account_mappings"
 branch_labels = None
 depends_on = None
 
 
-def upgrade() -> None:
-    import sqlalchemy as sa
+import alembic.op as op
+import sqlalchemy as sa
 
+
+def upgrade() -> None:
     # PostgreSQL
     op.add_column(
         "scenarios",
