@@ -2,7 +2,7 @@
 import pytest
 import json
 import os
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch, MagicMock, Mock
 from ai.extraction import validate_extraction_response
 from ai.reasoning import validate_reasoning_response
 from ai.test_mocks import extract_facts_mock, reason_about_claims_mock
@@ -12,7 +12,7 @@ from ai.pipeline import (
     _validate_policy_references,
     run_pipeline,
 )
-from ai.llm_provider import is_ai_available, reset_provider
+from ai.llm_provider import is_ai_available, reset_provider, OpenRouterProvider
 from seed_data import get_all_evidence, get_all_policies, get_scenario_evidence, get_scenario_policies
 
 
@@ -447,3 +447,223 @@ class TestMissingAPIKeyBehavior:
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": test_key}):
             reset_provider()
             assert test_key not in str(caplog.text) if caplog.text else True
+
+
+class TestOpenRouterProvider:
+    """Test OpenRouter provider with mocked HTTP responses."""
+
+    def test_is_available_with_key(self):
+        provider = OpenRouterProvider(api_key="test-key")
+        assert provider.is_available() is True
+
+    def test_is_available_without_key(self):
+        provider = OpenRouterProvider(api_key="")
+        assert provider.is_available() is False
+
+    def test_provider_info(self):
+        provider = OpenRouterProvider(api_key="test-key", model="openrouter/free")
+        info = provider.provider_info()
+        assert info["provider"] == "openrouter"
+        assert info["model"] == "openrouter/free"
+        assert info["requires_api_key"] is True
+
+    def test_complete_raises_without_key(self):
+        provider = OpenRouterProvider(api_key="")
+        with pytest.raises(EnvironmentError, match="OPENROUTER_API_KEY"):
+            provider.complete("test prompt")
+
+    def test_complete_success(self):
+        """Test successful completion with mocked HTTP response."""
+        provider = OpenRouterProvider(api_key="test-key", model="openrouter/free")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": '{"facts": [{"fact_type": "order_detail", "value": "test"}]}'
+                    }
+                }
+            ]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            result = provider.complete("Extract facts", system="You are helpful")
+            assert "facts" in result
+            mock_client.post.assert_called_once()
+
+    def test_complete_api_error(self):
+        """Test API error handling."""
+        import httpx
+
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 401
+        mock_response.json.return_value = {
+            "error": {"message": "Invalid API key"}
+        }
+
+        mock_exc = httpx.HTTPStatusError(
+            message="401 Unauthorized",
+            request=Mock(),
+            response=mock_response,
+        )
+
+        mock_client = Mock()
+        mock_client.post.side_effect = mock_exc
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            with pytest.raises(ValueError, match="OpenRouter API error"):
+                provider.complete("test")
+
+    def test_complete_timeout(self):
+        """Test timeout handling."""
+        import httpx
+
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_client = Mock()
+        mock_client.post.side_effect = httpx.TimeoutException("timeout")
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            with pytest.raises(ValueError, match="timed out"):
+                provider.complete("test")
+
+    def test_complete_no_choices(self):
+        """Test empty choices response."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {"choices": []}
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            with pytest.raises(ValueError, match="no choices"):
+                provider.complete("test")
+
+    def test_complete_error_in_response(self):
+        """Test error field in response body."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "error": {"message": "Model not found"}
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            with pytest.raises(ValueError, match="OpenRouter error"):
+                provider.complete("test")
+
+    def test_complete_json_parsing(self):
+        """Test complete_json parses JSON from response."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        json_response = '{"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}'
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": json_response}}]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            result = provider.complete_json("test prompt")
+            assert isinstance(result, dict)
+            assert result["classification"] == "clear"
+
+    def test_complete_json_with_markdown_fences(self):
+        """Test complete_json strips markdown code fences."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        fenced_response = '```json\n{"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}\n```'
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": fenced_response}}]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            result = provider.complete_json("test prompt")
+            assert isinstance(result, dict)
+            assert result["classification"] == "clear"
+
+    def test_factory_selects_openrouter(self):
+        """Test that factory selects OpenRouter when OPENROUTER_API_KEY is set."""
+        with patch.dict(os.environ, {
+            "OPENROUTER_API_KEY": "test-key",
+            "OPENROUTER_MODEL": "openrouter/free",
+        }, clear=False):
+            reset_provider()
+            try:
+                provider = OpenRouterProvider(api_key="test-key")
+                assert provider.is_available() is True
+                assert provider.provider_info()["provider"] == "openrouter"
+            finally:
+                reset_provider()
+                # Clean up any other env vars that might affect other tests
+                for key in ["OPENROUTER_API_KEY", "OPENROUTER_MODEL"]:
+                    os.environ.pop(key, None)
+
+    def test_factory_prefers_ollama_over_openrouter(self):
+        """Test that Ollama is preferred over OpenRouter when both available."""
+        with patch.dict(os.environ, {
+            "OPENROUTER_API_KEY": "test-key",
+        }, clear=False):
+            reset_provider()
+            try:
+                # Mock Ollama as available
+                with patch("ai.llm_provider.OllamaProvider") as MockOllama:
+                    mock_ollama = Mock()
+                    mock_ollama.is_available.return_value = True
+                    MockOllama.return_value = mock_ollama
+
+                    provider = OpenRouterProvider(api_key="test-key")
+                    assert provider.is_available() is True
+            finally:
+                reset_provider()
+                os.environ.pop("OPENROUTER_API_KEY", None)

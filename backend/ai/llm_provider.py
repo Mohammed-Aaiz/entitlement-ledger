@@ -2,7 +2,8 @@
 
 Priority order for auto-selection:
 1. Ollama (local, free, no API key)
-2. Anthropic Claude (requires ANTHROPIC_API_KEY)
+2. OpenRouter (cloud, requires OPENROUTER_API_KEY)
+3. Anthropic Claude (requires ANTHROPIC_API_KEY)
 
 Usage:
     provider = get_provider()
@@ -233,6 +234,109 @@ class AnthropicProvider(LLMProvider):
 
 
 # ---------------------------------------------------------------------------
+# OpenRouter provider
+# ---------------------------------------------------------------------------
+
+class OpenRouterProvider(LLMProvider):
+    """OpenRouter cloud LLM backend — requires OPENROUTER_API_KEY.
+
+    Uses the OpenAI-compatible chat completions endpoint.
+    """
+
+    def __init__(
+        self,
+        api_key: str = "",
+        model: str = "openrouter/free",
+        base_url: str = "https://openrouter.ai/api/v1",
+    ):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = base_url.rstrip("/")
+
+    def is_available(self) -> bool:
+        return bool(self.api_key)
+
+    def provider_info(self) -> dict:
+        return {
+            "provider": "openrouter",
+            "model": self.model,
+            "requires_api_key": True,
+            "description": f"OpenRouter cloud LLM ({self.model})",
+        }
+
+    def complete(
+        self,
+        prompt: str,
+        system: str = "",
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+    ) -> str:
+        import httpx
+
+        if not self.api_key:
+            raise EnvironmentError("OPENROUTER_API_KEY is not set")
+
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "https://entitlementledger.app",
+            "X-Title": "EntitlementLedger",
+        }
+
+        url = f"{self.base_url}/chat/completions"
+
+        logger.info("OpenRouter request: model=%s, prompt_len=%d", self.model, len(prompt))
+        t0 = time.time()
+
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                r = client.post(url, json=payload, headers=headers)
+                r.raise_for_status()
+        except httpx.TimeoutException:
+            raise ValueError(f"OpenRouter request timed out after 120s")
+        except httpx.HTTPStatusError as e:
+            status = e.response.status_code
+            try:
+                body = e.response.json()
+                detail = body.get("error", {}).get("message", str(e))
+            except Exception:
+                detail = str(e)
+            raise ValueError(f"OpenRouter API error ({status}): {detail}")
+        except httpx.RequestError as e:
+            raise ValueError(f"OpenRouter connection error: {e}")
+
+        elapsed = time.time() - t0
+        data = r.json()
+
+        # Handle OpenAI-compatible error responses
+        if "error" in data:
+            raise ValueError(f"OpenRouter error: {data['error'].get('message', str(data['error']))}")
+
+        choices = data.get("choices", [])
+        if not choices:
+            raise ValueError("OpenRouter returned no choices")
+
+        content = choices[0].get("message", {}).get("content", "")
+        if not content:
+            raise ValueError("OpenRouter returned empty content")
+
+        logger.info("OpenRouter response: %d chars in %.2fs", len(content), elapsed)
+        return content
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -242,7 +346,7 @@ _provider_instance: Optional[LLMProvider] = None
 def get_provider() -> LLMProvider:
     """Auto-select and cache the best available provider.
 
-    Priority: Ollama (local/free) > Anthropic (API key required).
+    Priority: Ollama (local/free) > OpenRouter (cloud) > Anthropic (cloud).
     """
     global _provider_instance
     if _provider_instance is not None:
@@ -255,6 +359,20 @@ def get_provider() -> LLMProvider:
     if ollama.is_available():
         logger.info("Using Ollama provider (model=%s)", model_name)
         _provider_instance = ollama
+        return _provider_instance
+
+    # Try OpenRouter if API key is present
+    openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
+    if openrouter_key:
+        openrouter_model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+        openrouter_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        openrouter = OpenRouterProvider(
+            api_key=openrouter_key,
+            model=openrouter_model,
+            base_url=openrouter_url,
+        )
+        logger.info("Using OpenRouter provider (model=%s)", openrouter_model)
+        _provider_instance = openrouter
         return _provider_instance
 
     # Fall back to Anthropic if API key is present
@@ -270,7 +388,8 @@ def get_provider() -> LLMProvider:
     raise EnvironmentError(
         "No LLM provider available. Either:\n"
         "  1. Start Ollama with a model: ollama serve && ollama pull qwen3.5\n"
-        "  2. Set ANTHROPIC_API_KEY environment variable.\n"
+        "  2. Set OPENROUTER_API_KEY environment variable.\n"
+        "  3. Set ANTHROPIC_API_KEY environment variable.\n"
         "Use seeded demo data for offline operation."
     )
 
