@@ -1533,5 +1533,118 @@ class TestGeminiProvider:
             with pytest.raises(ValueError, match="Failed to parse JSON"):
                 provider.complete_json("test")
 
+    def test_parsed_none_with_schema_falls_back_to_json_loads(self):
+        """Production regression: response.parsed is None (SDK validation failed)
+        but response.text contains valid JSON when response_schema was provided.
+        The complete() method should fall back to json.loads() and return a dict.
+
+        This is the exact production failure scenario:
+        - Gemini returns valid JSON via response_schema
+        - SDK's model_validate_json() silently fails (preamble, etc.)
+        - response.parsed is None
+        - complete() must parse the text and return a dict
+        """
+        from ai.llm_provider import ExtractionSchema
+
+        provider = GeminiProvider(api_key="test-key")
+
+        valid_json = (
+            '{"facts": [{"fact_type": "other", "value": "Payment captured", '
+            '"amount": null, "date": null, "evidence_quote": "some quote"}]}'
+        )
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        # Simulate: SDK validation failed → parsed=None, but text is valid JSON
+        mock_part = Mock()
+        mock_part.text = valid_json
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_candidate.finish_reason = "STOP"
+        mock_response = Mock()
+        mock_response.parsed = None
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            # complete() with response_schema should return a dict via json.loads fallback
+            result = provider.complete(
+                "extract", json_mode=True, response_schema=ExtractionSchema,
+            )
+            assert isinstance(result, dict)
+            assert "facts" in result
+            assert result["facts"][0]["fact_type"] == "other"
+
+            # complete_json() should pass the dict through without re-parsing
+            mock_client.models.generate_content.return_value = mock_response
+            result2 = provider.complete_json(
+                "extract", response_schema=ExtractionSchema,
+            )
+            assert isinstance(result2, dict)
+            assert result2 == result
+
+    def test_parsed_none_with_truncated_json_still_fails(self):
+        """Truncated JSON (output hit max_tokens) must still be rejected.
+
+        When the JSON is genuinely incomplete, both json.loads and
+        _parse_json_response should fail. The error must propagate.
+        """
+        from ai.llm_provider import ExtractionSchema
+
+        provider = GeminiProvider(api_key="test-key")
+
+        truncated_json = '{"facts": [{"fact_type": "other", "value": "test"'
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_part = Mock()
+        mock_part.text = truncated_json
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_candidate.finish_reason = "MAX_TOKENS"
+        mock_response = Mock()
+        mock_response.parsed = None
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            with pytest.raises(ValueError, match="Failed to parse JSON"):
+                provider.complete_json(
+                    "extract", response_schema=ExtractionSchema,
+                )
+
+    def test_parsed_none_without_schema_returns_raw_text(self):
+        """When no response_schema is provided and parsed is None,
+        complete() returns raw text (no json.loads attempt)."""
+        provider = GeminiProvider(api_key="test-key")
+
+        raw_text = 'Some non-JSON response from Gemini'
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_part = Mock()
+        mock_part.text = raw_text
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.parsed = None
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            # No response_schema → should return raw text, not try json.loads
+            result = provider.complete("test")
+            assert isinstance(result, str)
+            assert result == raw_text
+
 class TestAnthropicProvider:
     pass

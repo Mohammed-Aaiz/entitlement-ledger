@@ -426,7 +426,11 @@ class GeminiProvider(LLMProvider):
                 )
                 return content
 
-        # Fallback: extract from response.text (raw JSON string)
+        # --- response.parsed was None ---
+        # The SDK's model_validate_json() silently swallowed a ValidationError
+        # or JSONDecodeError.  This happens when Gemini returns valid JSON but
+        # with a preamble, or when the output is truncated.  We try to parse
+        # the raw text ourselves.
         if not response.candidates:
             raise ValueError("Gemini returned no candidates")
 
@@ -437,6 +441,38 @@ class GeminiProvider(LLMProvider):
         content = parts[0].text
         if not content:
             raise ValueError("Gemini returned empty text in response")
+
+        # Log safe diagnostic metadata — never log raw evidence or API keys.
+        finish_reason = None
+        try:
+            finish_reason = response.candidates[0].finish_reason
+        except (AttributeError, IndexError):
+            pass
+        logger.warning(
+            "Gemini response.parsed was None (SDK validation failed). "
+            "finish_reason=%s, text_len=%d, elapsed=%.2fs",
+            finish_reason, len(content), elapsed,
+        )
+
+        # When response_schema was provided, Gemini guarantees valid JSON
+        # at the API level.  The SDK's client-side model_validate_json()
+        # may fail on minor issues (preamble text, etc.).  Parse directly.
+        if response_schema is not None:
+            try:
+                parsed_dict = json.loads(content)
+                logger.info(
+                    "Gemini response (text→json fallback): parsed in %.2fs",
+                    elapsed,
+                )
+                return parsed_dict
+            except (json.JSONDecodeError, ValueError):
+                # JSON is genuinely malformed (likely truncated) —
+                # return raw text for _parse_json_response() in complete_json().
+                logger.warning(
+                    "Gemini text not valid JSON (likely truncated): "
+                    "first 100 chars: %s",
+                    content[:100],
+                )
 
         logger.info("Gemini response (text): %d chars in %.2fs", len(content), elapsed)
         return content
