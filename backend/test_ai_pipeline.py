@@ -1039,8 +1039,6 @@ class TestGeminiProvider:
         mock_genai = Mock()
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
-        mock_genai.types.Content.return_value = Mock()
-        mock_genai.types.Part.from_text.return_value = Mock()
         mock_genai.types.GenerateContentConfig.return_value = Mock()
 
         # Mock the response
@@ -1064,8 +1062,6 @@ class TestGeminiProvider:
         mock_genai = Mock()
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
-        mock_genai.types.Content.return_value = Mock()
-        mock_genai.types.Part.from_text.return_value = Mock()
 
         # Track what config is passed
         captured_config = Mock()
@@ -1092,8 +1088,6 @@ class TestGeminiProvider:
         mock_genai = Mock()
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
-        mock_genai.types.Content.return_value = Mock()
-        mock_genai.types.Part.from_text.return_value = Mock()
 
         captured_config = Mock(spec=[])  # No response_mime_type attribute
         mock_genai.types.GenerateContentConfig.return_value = captured_config
@@ -1118,8 +1112,6 @@ class TestGeminiProvider:
         mock_genai = Mock()
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
-        mock_genai.types.Content.return_value = Mock()
-        mock_genai.types.Part.from_text.return_value = Mock()
         mock_genai.types.GenerateContentConfig.return_value = Mock()
 
         mock_client.models.generate_content.side_effect = Exception("API_KEY_INVALID")
@@ -1135,8 +1127,6 @@ class TestGeminiProvider:
         mock_genai = Mock()
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
-        mock_genai.types.Content.return_value = Mock()
-        mock_genai.types.Part.from_text.return_value = Mock()
         mock_genai.types.GenerateContentConfig.return_value = Mock()
 
         mock_client.models.generate_content.side_effect = Exception("Rate limit exceeded")
@@ -1152,8 +1142,6 @@ class TestGeminiProvider:
         mock_genai = Mock()
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
-        mock_genai.types.Content.return_value = Mock()
-        mock_genai.types.Part.from_text.return_value = Mock()
         mock_genai.types.GenerateContentConfig.return_value = Mock()
 
         mock_response = Mock()
@@ -1171,8 +1159,6 @@ class TestGeminiProvider:
         mock_genai = Mock()
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
-        mock_genai.types.Content.return_value = Mock()
-        mock_genai.types.Part.from_text.return_value = Mock()
         mock_genai.types.GenerateContentConfig.return_value = Mock()
 
         mock_candidate = Mock()
@@ -1192,8 +1178,6 @@ class TestGeminiProvider:
         mock_genai = Mock()
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
-        mock_genai.types.Content.return_value = Mock()
-        mock_genai.types.Part.from_text.return_value = Mock()
         mock_genai.types.GenerateContentConfig.return_value = Mock()
 
         mock_part = Mock()
@@ -1217,8 +1201,6 @@ class TestGeminiProvider:
         mock_genai = Mock()
         mock_client = Mock()
         mock_genai.Client.return_value = mock_client
-        mock_genai.types.Content.return_value = Mock()
-        mock_genai.types.Part.from_text.return_value = Mock()
         mock_genai.types.GenerateContentConfig.return_value = Mock()
 
         mock_part = Mock()
@@ -1272,3 +1254,49 @@ class TestGeminiProvider:
                 reset_provider()
                 for key in ["GEMINI_API_KEY", "OPENROUTER_API_KEY"]:
                     os.environ.pop(key, None)
+
+    def test_no_part_from_text_positional_arg(self):
+        """Regression: verify we do NOT call Part.from_text() with positional args.
+
+        The google-genai SDK's Part.from_text() requires a keyword argument:
+            Part.from_text(text="...")
+        Passing a positional arg causes:
+            TypeError: Part.from_text() takes 1 positional argument but 2 were given
+
+        This test verifies the GeminiProvider passes contents as a plain string
+        to generate_content(), never touching Part.from_text().
+        """
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_part = Mock()
+        mock_part.text = '{"ok": true}'
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete("test prompt", system="system instruction")
+            assert result == '{"ok": true}'
+
+            # Verify generate_content was called with contents as a plain string
+            call_kwargs = mock_client.models.generate_content.call_args[1]
+            assert call_kwargs["contents"] == "test prompt", \
+                "contents must be a plain string, not Content/Part objects"
+
+            # Verify system_instruction was passed via config, not concatenated
+            config = call_kwargs["config"]
+            # The config is a Mock, verify system_instruction was set during construction
+            mock_genai.types.GenerateContentConfig.assert_called_once()
+            call_kwargs_config = mock_genai.types.GenerateContentConfig.call_args[1]
+            assert call_kwargs_config.get("system_instruction") == "system instruction", \
+                "system_instruction must be passed via GenerateContentConfig"
+
+            # Verify Part.from_text was never called
+            mock_genai.types.Part.from_text.assert_not_called() if hasattr(mock_genai.types.Part, 'from_text') else None

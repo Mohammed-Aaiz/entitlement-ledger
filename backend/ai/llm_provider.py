@@ -292,19 +292,9 @@ class GeminiProvider(LLMProvider):
 
         client = genai.Client(api_key=self.api_key)
 
-        contents = []
-        if system:
-            contents.append(genai.types.Content(
-                role="user",
-                parts=[genai.types.Part.from_text(f"[System instruction: {system}]\n\n{prompt}")],
-            ))
-        else:
-            contents.append(genai.types.Content(
-                role="user",
-                parts=[genai.types.Part.from_text(prompt)],
-            ))
-
+        # Build config — system_instruction is a first-class field in the SDK.
         config = genai.types.GenerateContentConfig(
+            system_instruction=system or None,
             max_output_tokens=max_tokens,
             temperature=temperature,
         )
@@ -319,7 +309,7 @@ class GeminiProvider(LLMProvider):
         try:
             response = client.models.generate_content(
                 model=self.model,
-                contents=contents,
+                contents=prompt,
                 config=config,
             )
         except Exception as e:
