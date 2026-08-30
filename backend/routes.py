@@ -211,15 +211,16 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                 "message": "Scenario has no configured policies. Run system initialization first.",
             }
 
-        # Fetch only unprocessed evidence from database for this tenant.
-        # Evidence already linked to a decision (linked_decision_ids != '[]')
-        # has already been analyzed and must not be re-processed.
+        # Fetch evidence not yet analyzed by the AI scenario pipeline.
+        # ai_analyzed tracks whether the AI has consumed this evidence,
+        # independent of linked_decision_ids (which may reference a
+        # deterministic Razorpay decision).
         cursor_ev = await db.execute(
-            "SELECT * FROM evidence WHERE tenant_id = ? AND linked_decision_ids = '[]'",
+            "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = 0",
             (user.tenant_id,),
         )
         ev_rows = await cursor_ev.fetchall()
-        evidence_records = [dict(r) if hasattr(r, 'keys') else {k: r[i] for i, k in enumerate(['evidence_id', 'tenant_id', 'source_type', 'raw_content', 'extracted_facts', 'linked_decision_ids', 'content_hash', 'version', 'created_at'])} for r in ev_rows]
+        evidence_records = [dict(r) if hasattr(r, 'keys') else {k: r[i] for i, k in enumerate(['evidence_id', 'tenant_id', 'source_type', 'raw_content', 'extracted_facts', 'linked_decision_ids', 'ai_analyzed', 'content_hash', 'version', 'created_at', 'updated_at'])} for r in ev_rows]
 
         # Parse JSON fields in evidence records
         for ev in evidence_records:
@@ -289,6 +290,11 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                         decision["decision_id"],
                         ev_result["evidence_id"],
                     ),
+                )
+                # Mark evidence as analyzed by AI so it is not reprocessed.
+                await db.execute(
+                    "UPDATE evidence SET ai_analyzed = 1 WHERE evidence_id = ?",
+                    (ev_result["evidence_id"],),
                 )
 
             await db.execute(

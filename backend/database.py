@@ -92,6 +92,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     raw_content TEXT NOT NULL,
     extracted_facts JSONB NOT NULL DEFAULT '[]',
     linked_decision_ids JSONB NOT NULL DEFAULT '[]',
+    ai_analyzed BOOLEAN NOT NULL DEFAULT FALSE,
     content_hash VARCHAR(128) NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
@@ -302,6 +303,7 @@ CREATE TABLE IF NOT EXISTS evidence (
     raw_content TEXT NOT NULL,
     extracted_facts TEXT NOT NULL DEFAULT '[]',
     linked_decision_ids TEXT NOT NULL DEFAULT '[]',
+    ai_analyzed INTEGER NOT NULL DEFAULT 0,
     content_hash TEXT NOT NULL DEFAULT '',
     version INTEGER NOT NULL DEFAULT 1,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -806,6 +808,7 @@ async def _sqlite_migrate(db):
         ("audit_log", "action", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("audit_log", "entity_type", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("scenarios", "policy_ids", "TEXT NOT NULL DEFAULT '[]'"),
+        ("evidence", "ai_analyzed", "INTEGER NOT NULL DEFAULT 0"),
     ]
     for table, column, col_def in migrations:
         try:
