@@ -345,18 +345,31 @@ class TestRunScenarioArchitecture:
 
     @pytest.mark.asyncio
     async def test_run_scenario_filter_uses_ai_analyzed(self):
-        """run_scenario must filter on ai_analyzed, not linked_decision_ids."""
+        """run_scenario must filter on ai_analyzed, not linked_decision_ids.
+
+        The eligibility SELECT (fetching evidence for AI processing) must use
+        ai_analyzed.  Read-modify-write SELECTs for linked_decision_ids updates
+        are excluded from this check.
+        """
         import inspect
         from routes import run_scenario
 
         source = inspect.getsource(run_scenario)
         assert "ai_analyzed" in source, "run_scenario must filter on ai_analyzed column"
-        # The SELECT query for evidence must use ai_analyzed, not linked_decision_ids
-        # (linked_decision_ids = '[]' may still appear in CASE/WHEN update logic)
-        import re
-        select_lines = [l.strip() for l in source.split('\n') if 'SELECT' in l and 'evidence' in l]
-        for line in select_lines:
-            assert 'ai_analyzed' in line, f"Evidence SELECT must filter on ai_analyzed, got: {line}"
+        # Check that the eligibility SELECT (fetching evidence rows for AI)
+        # uses ai_analyzed, not linked_decision_ids = '[]' as the filter.
+        select_lines = [
+            l.strip() for l in source.split('\n')
+            if 'SELECT' in l and 'evidence' in l
+        ]
+        # Exclude read-modify-write SELECTs that just read linked_decision_ids
+        eligibility_selects = [
+            l for l in select_lines
+            if 'SELECT linked_decision_ids' not in l
+        ]
+        for line in eligibility_selects:
+            assert 'ai_analyzed' in line, \
+                f"Evidence eligibility SELECT must filter on ai_analyzed, got: {line}"
 
 
 class TestAiAnalyzedArchitecture:
@@ -539,17 +552,21 @@ class TestAiAnalyzedArchitecture:
             )
             await db.commit()
 
-            # Simulate what run_scenario does: append AI decision to linked_decision_ids
-            # This is the CASE WHEN logic from routes.py
+            # Simulate what run_scenario does: append AI decision to linked_decision_ids.
+            # Use read-modify-write (same pattern as the fixed routes.py).
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                ("ev_razorpay_preserved",),
+            )
+            row = await cursor.fetchone()
+            current_ids = json.loads(row["linked_decision_ids"] if hasattr(row, "keys") else row[0])
+            current_ids.append(ai_decision_id)
             await db.execute(
-                "UPDATE evidence SET extracted_facts = ?, linked_decision_ids = "
-                "CASE WHEN linked_decision_ids = '[]' THEN ? "
-                "ELSE json_insert(linked_decision_ids, '$[' || json_array_length(linked_decision_ids) || ']', ?) END "
+                "UPDATE evidence SET extracted_facts = ?, linked_decision_ids = ? "
                 "WHERE evidence_id = ?",
                 (
                     json.dumps([{"fact": "ai_extracted"}]),
-                    json.dumps([ai_decision_id]),
-                    ai_decision_id,
+                    json.dumps(current_ids),
                     "ev_razorpay_preserved",
                 ),
             )
@@ -575,6 +592,244 @@ class TestAiAnalyzedArchitecture:
             assert ai_decision_id in linked, \
                 f"AI decision {ai_decision_id} must be appended to linked_decision_ids, got {linked}"
             assert len(linked) == 2, f"Expected 2 linked decisions, got {len(linked)}: {linked}"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_jsonb_append_empty_to_single_id(self):
+        """Append decision ID to empty linked_decision_ids -> ["dec_x"]."""
+        from database import get_db
+
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_jsonb_empty", "demo", "order",
+                    json.dumps({"test": True}),
+                    "[]", json.dumps([]),
+                    0, "hash_jsonb_empty", 1, datetime.now().isoformat(),
+                ),
+            )
+            await db.commit()
+
+            # Read-modify-write pattern (same as fixed routes.py)
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                ("ev_jsonb_empty",),
+            )
+            row = await cursor.fetchone()
+            current_ids = json.loads(row["linked_decision_ids"] if hasattr(row, "keys") else row[0])
+            current_ids.append("dec_new_1")
+            await db.execute(
+                "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                (json.dumps(current_ids), "ev_jsonb_empty"),
+            )
+            await db.commit()
+
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                ("ev_jsonb_empty",),
+            )
+            row = await cursor.fetchone()
+            linked = json.loads(row["linked_decision_ids"] if hasattr(row, "keys") else row[0])
+            assert linked == ["dec_new_1"], f"Expected [dec_new_1], got {linked}"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_jsonb_append_to_existing_ids(self):
+        """Append decision ID to ["dec_razorpay"] -> ["dec_razorpay","dec_ai"]."""
+        from database import get_db
+
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_jsonb_existing", "demo", "order",
+                    json.dumps({"test": True}),
+                    "[]", json.dumps(["dec_razorpay_existing"]),
+                    0, "hash_jsonb_existing", 1, datetime.now().isoformat(),
+                ),
+            )
+            await db.commit()
+
+            # Read-modify-write pattern
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                ("ev_jsonb_existing",),
+            )
+            row = await cursor.fetchone()
+            current_ids = json.loads(row["linked_decision_ids"] if hasattr(row, "keys") else row[0])
+            current_ids.append("dec_ai_new")
+            await db.execute(
+                "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                (json.dumps(current_ids), "ev_jsonb_existing"),
+            )
+            await db.commit()
+
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                ("ev_jsonb_existing",),
+            )
+            row = await cursor.fetchone()
+            linked = json.loads(row["linked_decision_ids"] if hasattr(row, "keys") else row[0])
+            assert linked == ["dec_razorpay_existing", "dec_ai_new"], \
+                f"Expected both IDs, got {linked}"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_jsonb_persisted_as_valid_json(self):
+        """Verify linked_decision_ids is stored as valid JSON in the database."""
+        from database import get_db
+
+        db = await get_db()
+        try:
+            test_ids = ["dec_a", "dec_b", "dec_c"]
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_jsonb_valid", "demo", "order",
+                    json.dumps({"test": True}),
+                    "[]", json.dumps(test_ids),
+                    0, "hash_jsonb_valid", 1, datetime.now().isoformat(),
+                ),
+            )
+            await db.commit()
+
+            # Read back and verify it's valid JSON
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                ("ev_jsonb_valid",),
+            )
+            row = await cursor.fetchone()
+            raw = row["linked_decision_ids"] if hasattr(row, "keys") else row[0]
+            # Must be parseable as JSON
+            parsed = json.loads(raw) if isinstance(raw, str) else raw
+            assert isinstance(parsed, list), f"Expected list, got {type(parsed)}"
+            assert parsed == test_ids, f"Expected {test_ids}, got {parsed}"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_jsonb_append_idempotent_no_duplicates(self):
+        """Appending the same decision ID twice must not create duplicates.
+
+        The deduplication guard ensures idempotency: re-running the same
+        scenario does not produce duplicate entries in linked_decision_ids.
+        """
+        from database import get_db
+        from routes import _parse_json_field
+
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_jsonb_idempotent", "demo", "order",
+                    json.dumps({"test": True}),
+                    "[]", json.dumps(["dec_razorpay_existing"]),
+                    0, "hash_idempotent", 1, datetime.now().isoformat(),
+                ),
+            )
+            await db.commit()
+
+            # Simulate the read-modify-write with dedup (same logic as routes.py)
+            decision_id = "dec_ai_new"
+            for _ in range(3):  # append 3 times
+                cursor = await db.execute(
+                    "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                    ("ev_jsonb_idempotent",),
+                )
+                row = await cursor.fetchone()
+                current_ids = _parse_json_field(
+                    row["linked_decision_ids"] if hasattr(row, "keys") else row[0]
+                )
+                if not isinstance(current_ids, list):
+                    current_ids = []
+                if decision_id not in current_ids:
+                    current_ids.append(decision_id)
+                await db.execute(
+                    "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                    (json.dumps(current_ids), "ev_jsonb_idempotent"),
+                )
+                await db.commit()
+
+            # Verify no duplicates
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                ("ev_jsonb_idempotent",),
+            )
+            row = await cursor.fetchone()
+            linked = json.loads(row["linked_decision_ids"] if hasattr(row, "keys") else row[0])
+            assert linked == ["dec_razorpay_existing", "dec_ai_new"], \
+                f"Expected exactly 2 IDs (no duplicates), got {linked}"
+            assert len(linked) == len(set(linked)), f"Duplicate IDs found: {linked}"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_jsonb_append_handles_none_and_malformed(self):
+        """Null/malformed linked_decision_ids must be handled safely."""
+        from database import get_db
+        from routes import _parse_json_field
+
+        db = await get_db()
+        try:
+            # Insert with empty string (malformed)
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_jsonb_malformed", "demo", "order",
+                    json.dumps({"test": True}),
+                    "[]", "",
+                    0, "hash_malformed", 1, datetime.now().isoformat(),
+                ),
+            )
+            await db.commit()
+
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                ("ev_jsonb_malformed",),
+            )
+            row = await cursor.fetchone()
+            raw = row["linked_decision_ids"] if hasattr(row, "keys") else row[0]
+            current_ids = _parse_json_field(raw)
+            if not isinstance(current_ids, list):
+                current_ids = []
+            current_ids.append("dec_from_malformed")
+
+            await db.execute(
+                "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                (json.dumps(current_ids), "ev_jsonb_malformed"),
+            )
+            await db.commit()
+
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                ("ev_jsonb_malformed",),
+            )
+            row = await cursor.fetchone()
+            linked = json.loads(row["linked_decision_ids"] if hasattr(row, "keys") else row[0])
+            assert linked == ["dec_from_malformed"], \
+                f"Expected [dec_from_malformed], got {linked}"
         finally:
             await db.close()
 

@@ -278,18 +278,31 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                 ),
             )
 
-            # Update evidence with extracted facts and link
+            # Update evidence with extracted facts and link.
+            # Read-modify-write to avoid SQLite/PostgreSQL json_insert
+            # compatibility issues (PostgreSQL cannot cast bare strings to jsonb).
             for ev_result in result["evidence"]:
+                ev_id = ev_result["evidence_id"]
+                cursor = await db.execute(
+                    "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
+                    (ev_id,),
+                )
+                row = await cursor.fetchone()
+                current_ids = _parse_json_field(
+                    row["linked_decision_ids"] if hasattr(row, "keys") else row[0]
+                )
+                if not isinstance(current_ids, list):
+                    current_ids = []
+                new_id = decision["decision_id"]
+                if new_id not in current_ids:
+                    current_ids.append(new_id)
                 await db.execute(
-                    "UPDATE evidence SET extracted_facts = ?, linked_decision_ids = "
-                    "CASE WHEN linked_decision_ids = '[]' THEN ? "
-                    "ELSE json_insert(linked_decision_ids, '$[' || json_array_length(linked_decision_ids) || ']', ?) END "
+                    "UPDATE evidence SET extracted_facts = ?, linked_decision_ids = ? "
                     "WHERE evidence_id = ?",
                     (
                         json.dumps(ev_result.get("extracted_facts", [])),
-                        json.dumps([decision["decision_id"]]),
-                        decision["decision_id"],
-                        ev_result["evidence_id"],
+                        json.dumps(current_ids),
+                        ev_id,
                     ),
                 )
                 # Mark evidence as analyzed by AI so it is not reprocessed.
@@ -987,15 +1000,27 @@ async def analyze_decision(
             ),
         )
 
-        # Link evidence
+        # Link evidence — read-modify-write to avoid SQLite/PostgreSQL
+        # json_insert compatibility issues.
         for ev_id in evidence_ids:
-            await db.execute(
-                "UPDATE evidence SET linked_decision_ids = "
-                "CASE WHEN linked_decision_ids = '[]' THEN ? "
-                "ELSE json_insert(linked_decision_ids, '$[' || json_array_length(linked_decision_ids) || ']', ?) END "
-                "WHERE evidence_id = ? AND tenant_id = ?",
-                (json.dumps([decision_id]), decision_id, ev_id, user.tenant_id),
+            cursor = await db.execute(
+                "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ? AND tenant_id = ?",
+                (ev_id, user.tenant_id),
             )
+            row = await cursor.fetchone()
+            if row:
+                current_ids = _parse_json_field(
+                    row["linked_decision_ids"] if hasattr(row, "keys") else row[0]
+                )
+                if not isinstance(current_ids, list):
+                    current_ids = []
+                if decision_id not in current_ids:
+                    current_ids.append(decision_id)
+                await db.execute(
+                    "UPDATE evidence SET linked_decision_ids = ? "
+                    "WHERE evidence_id = ? AND tenant_id = ?",
+                    (json.dumps(current_ids), ev_id, user.tenant_id),
+                )
 
         await db.commit()
 
