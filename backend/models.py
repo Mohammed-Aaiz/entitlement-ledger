@@ -26,7 +26,7 @@ class DecisionCreate(BaseModel):
     final_amount: int
     policy_version_id: str
     approver_id: str
-    approved_at: str
+    approved_at: Optional[str] = None
     model_output: dict = {}
     prev_decision_hash: str = "genesis"
     decision_hash: str = ""
@@ -42,7 +42,7 @@ class DecisionResponse(BaseModel):
     final_amount: int
     policy_version_id: str
     approver_id: str
-    approved_at: str
+    approved_at: Optional[str] = None
     model_output: dict
     prev_decision_hash: str
     decision_hash: str
@@ -84,7 +84,7 @@ class DefensePacket(BaseModel):
     evidence: list[EvidenceResponse]
     policies: list[PolicyResponse]
     approver_id: str
-    approved_at: str
+    approved_at: Optional[str] = None
     integrity: VerificationResult
 
 

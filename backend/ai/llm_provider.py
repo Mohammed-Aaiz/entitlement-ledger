@@ -328,12 +328,46 @@ class OpenRouterProvider(LLMProvider):
         if not choices:
             raise ValueError("OpenRouter returned no choices")
 
-        content = choices[0].get("message", {}).get("content", "")
-        if not content:
-            raise ValueError("OpenRouter returned empty content")
+        message = choices[0].get("message", {})
 
-        logger.info("OpenRouter response: %d chars in %.2fs", len(content), elapsed)
-        return content
+        # Safe debug logging: response structure only, never content/keys
+        logger.info(
+            "OpenRouter response structure: choice_keys=%s, message_keys=%s, "
+            "finish_reason=%s, has_content=%s, has_reasoning=%s",
+            list(choices[0].keys()),
+            list(message.keys()),
+            choices[0].get("finish_reason"),
+            bool(message.get("content")),
+            bool(message.get("reasoning_content")),
+        )
+
+        # Extract content: try standard content first, then reasoning_content
+        # fallback.  Some reasoning models (DeepSeek R1, Qwen w/ thinking)
+        # return their output in reasoning_content while content is null/empty.
+        content = message.get("content") or ""
+        reasoning = message.get("reasoning_content") or ""
+
+        # Prefer content if present; fall back to reasoning_content
+        effective = content or reasoning
+
+        if not effective:
+            logger.error(
+                "OpenRouter returned no usable content. response_keys=%s, "
+                "message_keys=%s",
+                list(data.keys()),
+                list(message.keys()),
+            )
+            raise ValueError(
+                "OpenRouter returned empty content. "
+                f"Model may not support this request format. "
+                f"Response keys: {list(data.keys())}"
+            )
+
+        logger.info(
+            "OpenRouter response: %d chars (content=%d, reasoning=%d) in %.2fs",
+            len(effective), len(content), len(reasoning), elapsed,
+        )
+        return effective
 
 
 # ---------------------------------------------------------------------------

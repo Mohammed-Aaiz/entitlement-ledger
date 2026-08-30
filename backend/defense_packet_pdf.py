@@ -99,7 +99,7 @@ def generate_defense_packet_pdf(defense_packet: dict, audit_trail: list[dict] = 
         ["Status", decision.get("status", "N/A")],
         ["Created", decision.get("created_at", "N/A")],
         ["Approver", decision.get("approver_id", "N/A")],
-        ["Approved At", decision.get("approved_at", "N/A")],
+        ["Approved At", decision.get("approved_at") or "N/A"],
     ]
     summary_table = Table(summary_data, colWidths=[120, 340])
     summary_table.setStyle(TableStyle([

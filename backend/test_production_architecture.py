@@ -645,3 +645,183 @@ class TestAiAnalyzedArchitecture:
             assert "ev_compat_test" in evidence_ids
         finally:
             await db.close()
+
+
+class TestApprovedAtNullable:
+    """Verify approved_at is nullable for REVIEW_REQUIRED AI decisions."""
+
+    @pytest.mark.asyncio
+    async def test_review_required_decision_with_null_approved_at(self):
+        """A REVIEW_REQUIRED decision with approved_at=None can be persisted."""
+        from database import get_db
+        from main import _ensure_system_config
+        from hash_chain import compute_decision_hash
+
+        await _ensure_system_config()
+
+        db = await get_db()
+        try:
+            decision_id = "dec_test_null_approved"
+            now = datetime.now(timezone.utc).isoformat()
+            decision_data = {
+                "decision_id": decision_id,
+                "entity_type": "seller",
+                "entity_id": "seller_test",
+                "gross_amount": 100000,
+                "line_items": json.dumps([]),
+                "final_amount": 92000,
+                "policy_version_id": "platform_1_1",
+                "approver_id": "ai_pipeline",
+                "approved_at": None,
+                "model_output": json.dumps({"source": "ai_pipeline"}),
+                "prev_decision_hash": "genesis",
+                "decision_hash": "",
+                "created_at": now,
+                "status": "REVIEW_REQUIRED",
+            }
+            # Compute hash (approved_at=None must be handled)
+            hash_input = {k: v for k, v in decision_data.items() if k != "decision_hash"}
+            decision_data["decision_hash"] = compute_decision_hash(hash_input, "genesis")
+
+            await db.execute(
+                "INSERT INTO decisions "
+                "(decision_id, tenant_id, entity_type, entity_id, gross_amount, line_items, "
+                "final_amount, policy_version_id, approver_id, approved_at, model_output, "
+                "prev_decision_hash, decision_hash, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    decision_data["decision_id"], "demo",
+                    decision_data["entity_type"], decision_data["entity_id"],
+                    decision_data["gross_amount"], decision_data["line_items"],
+                    decision_data["final_amount"], decision_data["policy_version_id"],
+                    decision_data["approver_id"], decision_data["approved_at"],
+                    decision_data["model_output"], decision_data["prev_decision_hash"],
+                    decision_data["decision_hash"], decision_data["created_at"],
+                    decision_data["status"],
+                ),
+            )
+            await db.commit()
+
+            # Read it back — approved_at must be NULL
+            cursor = await db.execute(
+                "SELECT approved_at, status FROM decisions WHERE decision_id = ?",
+                (decision_id,),
+            )
+            row = await cursor.fetchone()
+            assert row is not None, "Decision must be persisted"
+            approved_at = row["approved_at"] if hasattr(row, "keys") else row[0]
+            status = row["status"] if hasattr(row, "keys") else row[1]
+            assert approved_at is None, f"approved_at must be NULL for REVIEW_REQUIRED, got {approved_at}"
+            assert status == "REVIEW_REQUIRED"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_approved_decision_has_timestamp(self):
+        """An APPROVED Razorpay decision must have a real timestamp in approved_at."""
+        from database import get_db
+        from main import _ensure_system_config
+        from hash_chain import compute_decision_hash
+
+        await _ensure_system_config()
+
+        db = await get_db()
+        try:
+            decision_id = "dec_test_approved_ts"
+            now = datetime.now(timezone.utc).isoformat()
+            decision_data = {
+                "decision_id": decision_id,
+                "entity_type": "seller",
+                "entity_id": "seller_razorpay",
+                "gross_amount": 100000,
+                "line_items": json.dumps([]),
+                "final_amount": 92000,
+                "policy_version_id": "platform_1_1",
+                "approver_id": "razorpay_pipeline",
+                "approved_at": now,
+                "model_output": json.dumps({"source": "razorpay"}),
+                "prev_decision_hash": "genesis",
+                "decision_hash": "",
+                "created_at": now,
+                "status": "APPROVED",
+            }
+            hash_input = {k: v for k, v in decision_data.items() if k != "decision_hash"}
+            decision_data["decision_hash"] = compute_decision_hash(hash_input, "genesis")
+
+            await db.execute(
+                "INSERT INTO decisions "
+                "(decision_id, tenant_id, entity_type, entity_id, gross_amount, line_items, "
+                "final_amount, policy_version_id, approver_id, approved_at, model_output, "
+                "prev_decision_hash, decision_hash, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    decision_data["decision_id"], "demo",
+                    decision_data["entity_type"], decision_data["entity_id"],
+                    decision_data["gross_amount"], decision_data["line_items"],
+                    decision_data["final_amount"], decision_data["policy_version_id"],
+                    decision_data["approver_id"], decision_data["approved_at"],
+                    decision_data["model_output"], decision_data["prev_decision_hash"],
+                    decision_data["decision_hash"], decision_data["created_at"],
+                    decision_data["status"],
+                ),
+            )
+            await db.commit()
+
+            cursor = await db.execute(
+                "SELECT approved_at, status FROM decisions WHERE decision_id = ?",
+                (decision_id,),
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+            approved_at = row["approved_at"] if hasattr(row, "keys") else row[0]
+            status = row["status"] if hasattr(row, "keys") else row[1]
+            assert approved_at is not None, "APPROVED decision must have a timestamp"
+            assert status == "APPROVED"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_api_response_serializes_null_approved_at(self):
+        """API response must serialize null approved_at as null (not empty string)."""
+        from routes import _to_iso_str, _decision_to_response
+
+        # Simulate a REVIEW_REQUIRED decision from the database
+        db_row = {
+            "decision_id": "dec_test_serialize",
+            "entity_type": "seller",
+            "entity_id": "seller_x",
+            "gross_amount": 100000,
+            "line_items": [],
+            "final_amount": 92000,
+            "policy_version_id": "platform_1_1",
+            "approver_id": "ai_pipeline",
+            "approved_at": None,
+            "model_output": {},
+            "prev_decision_hash": "genesis",
+            "decision_hash": "abc123",
+            "created_at": "2025-01-01T00:00:00",
+            "status": "REVIEW_REQUIRED",
+        }
+
+        response = _decision_to_response(db_row)
+        assert response.approved_at is None, f"Response approved_at must be None, got {response.approved_at}"
+        assert response.status == "REVIEW_REQUIRED"
+
+        # Simulate an APPROVED Razorpay decision
+        db_row_approved = {
+            **db_row,
+            "decision_id": "dec_test_serialize_approved",
+            "approved_at": "2025-01-01T12:00:00+00:00",
+            "status": "APPROVED",
+        }
+        response_approved = _decision_to_response(db_row_approved)
+        assert response_approved.approved_at == "2025-01-01T12:00:00+00:00"
+
+    @pytest.mark.asyncio
+    async def test_to_iso_str_passes_none_through(self):
+        """_to_iso_str must return None for None input, not empty string."""
+        from routes import _to_iso_str
+
+        assert _to_iso_str(None) is None
+        assert _to_iso_str("") is None
+        assert _to_iso_str("2025-01-01T00:00:00") == "2025-01-01T00:00:00"

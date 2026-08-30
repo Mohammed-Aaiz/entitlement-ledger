@@ -251,7 +251,7 @@ def run_pipeline(
         "final_amount": final_amount,
         "policy_version_id": ",".join(available_policy_ids),
         "approver_id": "ai_pipeline",
-        "approved_at": "",  # Not approved yet - REVIEW_REQUIRED
+        "approved_at": None,  # Not approved yet - REVIEW_REQUIRED
         "model_output": {
             "claims": reasoning_result["claims"],
             "classification": reasoning_result["classification"],

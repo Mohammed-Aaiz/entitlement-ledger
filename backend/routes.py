@@ -100,17 +100,18 @@ def _row_to_decision(row) -> dict:
     }
 
 
-def _to_iso_str(value) -> str:
-    """Convert a value to an ISO-format string.
+def _to_iso_str(value) -> str | None:
+    """Convert a value to an ISO-format string, or None.
 
     PostgreSQL returns datetime objects for timestamp columns while SQLite
-    returns strings.  Pydantic models in this project expect strings, so we
-    normalise everything here.
+    returns strings.  Pydantic models accept Optional[str] for approved_at
+    (REVIEW_REQUIRED decisions have no approval timestamp), so we pass
+    None through and normalise everything else to a string.
     """
     if value is None:
-        return ""
+        return None
     if isinstance(value, str):
-        return value
+        return value or None
     # datetime / date / etc.
     if hasattr(value, "isoformat"):
         return value.isoformat()

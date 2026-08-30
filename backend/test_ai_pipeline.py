@@ -667,3 +667,261 @@ class TestOpenRouterProvider:
             finally:
                 reset_provider()
                 os.environ.pop("OPENROUTER_API_KEY", None)
+
+    def test_complete_reasoning_content_fallback(self):
+        """When content is empty but reasoning_content exists, use reasoning_content.
+
+        Some reasoning models (DeepSeek R1, Qwen w/ thinking) return their
+        output in reasoning_content while content is null/empty.
+        """
+        provider = OpenRouterProvider(api_key="test-key", model="openrouter/free")
+
+        json_response = '{"facts": [{"fact_type": "order_detail", "value": "test", "evidence_quote": "test quote here"}]}'
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "reasoning_content": json_response,
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            result = provider.complete("Extract facts")
+            assert result == json_response
+            assert "facts" in result
+
+    def test_complete_content_empty_string_fallback(self):
+        """When content is empty string but reasoning_content has data."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        reasoning = '{"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}'
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": reasoning,
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            result = provider.complete("test")
+            assert result == reasoning
+
+    def test_complete_both_empty_raises(self):
+        """When both content and reasoning_content are empty, raise ValueError."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "",
+                        "reasoning_content": "",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            with pytest.raises(ValueError, match="empty content"):
+                provider.complete("test")
+
+    def test_complete_no_message_key_raises(self):
+        """When message key is missing entirely, raise ValueError."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            with pytest.raises(ValueError, match="empty content"):
+                provider.complete("test")
+
+    def test_complete_json_from_reasoning_content(self):
+        """complete_json should parse JSON from reasoning_content when content is empty."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        json_in_reasoning = '{"claims": [{"claim_type": "sla_breach", "policy_clause_id": "sla_4_2", "evidence_ids": ["ev_1"], "reasoning": "test"}], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}'
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": None,
+                        "reasoning_content": json_in_reasoning,
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            result = provider.complete_json("test prompt")
+            assert isinstance(result, dict)
+            assert result["classification"] == "clear"
+            assert len(result["claims"]) == 1
+
+    def test_complete_malformed_json_in_content(self):
+        """Malformed JSON in content should raise via complete_json."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": "This is not JSON at all, just plain text.",
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            with pytest.raises(ValueError, match="Failed to parse JSON"):
+                provider.complete_json("test prompt")
+
+    def test_complete_api_error_403(self):
+        """Test 403 Forbidden error handling."""
+        import httpx
+
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 403
+        mock_response.json.return_value = {
+            "error": {"message": "Model requires paid account"}
+        }
+
+        mock_exc = httpx.HTTPStatusError(
+            message="403 Forbidden",
+            request=Mock(),
+            response=mock_response,
+        )
+
+        mock_client = Mock()
+        mock_client.post.side_effect = mock_exc
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            with pytest.raises(ValueError, match="OpenRouter API error.*403"):
+                provider.complete("test")
+
+    def test_complete_connection_error(self):
+        """Test connection error handling."""
+        import httpx
+
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_client = Mock()
+        mock_client.post.side_effect = httpx.ConnectError("Connection refused")
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            with pytest.raises(ValueError, match="connection error"):
+                provider.complete("test")
+
+    def test_content_preferred_over_reasoning(self):
+        """When both content and reasoning_content exist, prefer content."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        content_text = "This is the main content"
+        reasoning_text = "This is the reasoning"
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [
+                {
+                    "message": {
+                        "content": content_text,
+                        "reasoning_content": reasoning_text,
+                    },
+                    "finish_reason": "stop",
+                }
+            ]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            result = provider.complete("test")
+            assert result == content_text
