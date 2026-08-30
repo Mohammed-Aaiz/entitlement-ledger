@@ -100,6 +100,23 @@ def _row_to_decision(row) -> dict:
     }
 
 
+def _to_iso_str(value) -> str:
+    """Convert a value to an ISO-format string.
+
+    PostgreSQL returns datetime objects for timestamp columns while SQLite
+    returns strings.  Pydantic models in this project expect strings, so we
+    normalise everything here.
+    """
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    # datetime / date / etc.
+    if hasattr(value, "isoformat"):
+        return value.isoformat()
+    return str(value)
+
+
 def _decision_to_response(d: dict) -> DecisionResponse:
     items = d.get("line_items", [])
     parsed_items = []
@@ -117,11 +134,11 @@ def _decision_to_response(d: dict) -> DecisionResponse:
         final_amount=d["final_amount"],
         policy_version_id=d["policy_version_id"],
         approver_id=d["approver_id"],
-        approved_at=d["approved_at"],
+        approved_at=_to_iso_str(d["approved_at"]),
         model_output=_parse_json_field(d.get("model_output", {})),
         prev_decision_hash=d["prev_decision_hash"],
         decision_hash=d["decision_hash"],
-        created_at=d["created_at"],
+        created_at=_to_iso_str(d["created_at"]),
         status=d.get("status", "APPROVED"),
     )
 
@@ -594,7 +611,7 @@ async def get_defense_packet(decision_id: str, user: CurrentUser = Depends(get_c
             evidence=linked_evidence,
             policies=relevant_policies,
             approver_id=d["approver_id"],
-            approved_at=d["approved_at"],
+            approved_at=_to_iso_str(d["approved_at"]),
             integrity=VerificationResult(**chain_result),
         )
     finally:
