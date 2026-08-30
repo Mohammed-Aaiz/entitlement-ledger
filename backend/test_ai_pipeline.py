@@ -12,7 +12,7 @@ from ai.pipeline import (
     _validate_policy_references,
     run_pipeline,
 )
-from ai.llm_provider import is_ai_available, reset_provider, OpenRouterProvider
+from ai.llm_provider import is_ai_available, reset_provider, get_provider, OpenRouterProvider, GeminiProvider
 from seed_data import get_all_evidence, get_all_policies, get_scenario_evidence, get_scenario_policies
 
 
@@ -925,3 +925,350 @@ class TestOpenRouterProvider:
 
             result = provider.complete("test")
             assert result == content_text
+
+    def test_complete_json_sends_json_mode(self):
+        """complete_json must pass json_mode=True to complete()."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": '{"key": "value"}'}}]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            result = provider.complete_json("test prompt")
+            assert isinstance(result, dict)
+            assert result["key"] == "value"
+
+            # Verify response_format was sent in the payload
+            call_args = mock_client.post.call_args
+            payload = call_args[1].get("json") or call_args[0][1] if len(call_args[0]) > 1 else call_args[1]["json"]
+            assert payload.get("response_format") == {"type": "json_object"}, \
+                "complete_json must include response_format in payload"
+
+    def test_complete_no_json_mode_by_default(self):
+        """Plain complete() must NOT send response_format."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": "hello"}}]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            provider.complete("test prompt")
+            call_args = mock_client.post.call_args
+            payload = call_args[1].get("json") or call_args[0][1] if len(call_args[0]) > 1 else call_args[1]["json"]
+            assert "response_format" not in payload, \
+                "Plain complete() must not include response_format"
+
+    def test_complete_json_mode_true_sends_response_format(self):
+        """complete(json_mode=True) must include response_format."""
+        provider = OpenRouterProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.raise_for_status = Mock()
+        mock_response.json.return_value = {
+            "choices": [{"message": {"content": '{"a": 1}'}}]
+        }
+
+        mock_client = Mock()
+        mock_client.post.return_value = mock_response
+
+        with patch("httpx.Client") as mock_client_cls:
+            mock_client_cls.return_value.__enter__ = Mock(return_value=mock_client)
+            mock_client_cls.return_value.__exit__ = Mock(return_value=False)
+
+            provider.complete("test", json_mode=True)
+            call_args = mock_client.post.call_args
+            payload = call_args[1].get("json") or call_args[0][1] if len(call_args[0]) > 1 else call_args[1]["json"]
+            assert payload.get("response_format") == {"type": "json_object"}
+
+
+class TestGeminiProvider:
+    """Test Gemini provider with mocked SDK responses."""
+
+    def test_is_available_with_key_and_sdk(self):
+        provider = GeminiProvider(api_key="test-key")
+        with patch.dict("sys.modules", {"google": Mock(), "google.genai": Mock()}):
+            assert provider.is_available() is True
+
+    def test_is_available_without_key(self):
+        provider = GeminiProvider(api_key="")
+        assert provider.is_available() is False
+
+    def test_is_available_without_sdk(self):
+        provider = GeminiProvider(api_key="test-key")
+        with patch.dict("sys.modules", {"google": None, "google.genai": None}):
+            assert provider.is_available() is False
+
+    def test_provider_info(self):
+        provider = GeminiProvider(api_key="test-key", model="gemini-2.5-flash")
+        info = provider.provider_info()
+        assert info["provider"] == "gemini"
+        assert info["model"] == "gemini-2.5-flash"
+        assert info["requires_api_key"] is True
+
+    def test_complete_raises_without_key(self):
+        provider = GeminiProvider(api_key="")
+        with pytest.raises(EnvironmentError, match="GEMINI_API_KEY"):
+            provider.complete("test prompt")
+
+    def test_complete_success(self):
+        """Test successful completion with mocked SDK response."""
+        provider = GeminiProvider(api_key="test-key", model="gemini-2.5-flash")
+
+        # Mock the genai module
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.Content.return_value = Mock()
+        mock_genai.types.Part.from_text.return_value = Mock()
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        # Mock the response
+        mock_part = Mock()
+        mock_part.text = '{"facts": [{"fact_type": "order_detail", "value": "test"}]}'
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete("Extract facts", system="You are helpful")
+            assert "facts" in result
+            mock_client.models.generate_content.assert_called_once()
+
+    def test_complete_json_mode_sends_response_mime_type(self):
+        """When json_mode=True, config must have response_mime_type set."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.Content.return_value = Mock()
+        mock_genai.types.Part.from_text.return_value = Mock()
+
+        # Track what config is passed
+        captured_config = Mock()
+        captured_config.response_mime_type = None
+        mock_genai.types.GenerateContentConfig.return_value = captured_config
+
+        mock_part = Mock()
+        mock_part.text = '{"key": "value"}'
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            provider.complete("test", json_mode=True)
+            # Verify json_mode was set on config
+            assert captured_config.response_mime_type == "application/json"
+
+    def test_complete_no_json_mode_by_default(self):
+        """When json_mode=False, config must NOT have response_mime_type."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.Content.return_value = Mock()
+        mock_genai.types.Part.from_text.return_value = Mock()
+
+        captured_config = Mock(spec=[])  # No response_mime_type attribute
+        mock_genai.types.GenerateContentConfig.return_value = captured_config
+
+        mock_part = Mock()
+        mock_part.text = "hello"
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            provider.complete("test", json_mode=False)
+            # Config should not have response_mime_type set
+            assert not hasattr(captured_config, "response_mime_type") or captured_config.response_mime_type is None
+
+    def test_complete_api_error(self):
+        """Test API error handling."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.Content.return_value = Mock()
+        mock_genai.types.Part.from_text.return_value = Mock()
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_client.models.generate_content.side_effect = Exception("API_KEY_INVALID")
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            with pytest.raises(ValueError, match="invalid API key"):
+                provider.complete("test")
+
+    def test_complete_quota_error(self):
+        """Test quota/rate limit error handling."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.Content.return_value = Mock()
+        mock_genai.types.Part.from_text.return_value = Mock()
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_client.models.generate_content.side_effect = Exception("Rate limit exceeded")
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            with pytest.raises(ValueError, match="quota/rate limit"):
+                provider.complete("test")
+
+    def test_complete_no_candidates(self):
+        """Test empty candidates response."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.Content.return_value = Mock()
+        mock_genai.types.Part.from_text.return_value = Mock()
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_response = Mock()
+        mock_response.candidates = []
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            with pytest.raises(ValueError, match="no candidates"):
+                provider.complete("test")
+
+    def test_complete_empty_parts(self):
+        """Test response with empty parts."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.Content.return_value = Mock()
+        mock_genai.types.Part.from_text.return_value = Mock()
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_candidate = Mock()
+        mock_candidate.content.parts = []
+        mock_response = Mock()
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            with pytest.raises(ValueError, match="empty response"):
+                provider.complete("test")
+
+    def test_complete_empty_text(self):
+        """Test response with empty text in parts."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.Content.return_value = Mock()
+        mock_genai.types.Part.from_text.return_value = Mock()
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_part = Mock()
+        mock_part.text = ""
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            with pytest.raises(ValueError, match="empty text"):
+                provider.complete("test")
+
+    def test_complete_json_parsing(self):
+        """Test complete_json parses JSON from Gemini response."""
+        provider = GeminiProvider(api_key="test-key")
+
+        json_response = '{"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}'
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.Content.return_value = Mock()
+        mock_genai.types.Part.from_text.return_value = Mock()
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_part = Mock()
+        mock_part.text = json_response
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete_json("test prompt")
+            assert isinstance(result, dict)
+            assert result["classification"] == "clear"
+
+    def test_factory_selects_gemini(self):
+        """Test that factory selects Gemini when GEMINI_API_KEY is set."""
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "test-key",
+            "GEMINI_MODEL": "gemini-2.5-flash",
+        }, clear=False):
+            reset_provider()
+            try:
+                with patch.dict("sys.modules", {"google": Mock(), "google.genai": Mock()}):
+                    provider = GeminiProvider(api_key="test-key")
+                    assert provider.is_available() is True
+                    assert provider.provider_info()["provider"] == "gemini"
+            finally:
+                reset_provider()
+                for key in ["GEMINI_API_KEY", "GEMINI_MODEL"]:
+                    os.environ.pop(key, None)
+
+    def test_factory_prefers_gemini_over_openrouter(self):
+        """Test that Gemini is preferred over OpenRouter when both keys are present."""
+        with patch.dict(os.environ, {
+            "GEMINI_API_KEY": "gemini-key",
+            "OPENROUTER_API_KEY": "openrouter-key",
+        }, clear=False):
+            reset_provider()
+            try:
+                with patch.dict("sys.modules", {"google": Mock(), "google.genai": Mock()}):
+                    # Mock Ollama as unavailable
+                    with patch("ai.llm_provider.OllamaProvider") as MockOllama:
+                        mock_ollama = Mock()
+                        mock_ollama.is_available.return_value = False
+                        MockOllama.return_value = mock_ollama
+
+                        provider = get_provider()
+                        assert provider.provider_info()["provider"] == "gemini"
+            finally:
+                reset_provider()
+                for key in ["GEMINI_API_KEY", "OPENROUTER_API_KEY"]:
+                    os.environ.pop(key, None)

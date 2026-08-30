@@ -31,8 +31,14 @@ class LLMProvider(ABC):
         system: str = "",
         max_tokens: int = 2048,
         temperature: float = 0.0,
+        json_mode: bool = False,
     ) -> str:
-        """Send a prompt and return the raw text response."""
+        """Send a prompt and return the raw text response.
+
+        When *json_mode* is True the provider should request structured
+        JSON output from the model (e.g. response_format).  Providers
+        that do not support this parameter simply ignore it.
+        """
         ...
 
     @abstractmethod
@@ -54,9 +60,10 @@ class LLMProvider(ABC):
     ) -> dict:
         """Complete and parse the response as JSON.
 
-        Handles markdown code fences automatically.
+        Requests json_mode from the provider when supported and handles
+        markdown code fences automatically.
         """
-        raw = self.complete(prompt, system=system, max_tokens=max_tokens, temperature=temperature)
+        raw = self.complete(prompt, system=system, max_tokens=max_tokens, temperature=temperature, json_mode=True)
         return _parse_json_response(raw)
 
 
@@ -136,6 +143,7 @@ class OllamaProvider(LLMProvider):
         system: str = "",
         max_tokens: int = 2048,
         temperature: float = 0.0,
+        json_mode: bool = False,
     ) -> str:
         import httpx
 
@@ -155,6 +163,9 @@ class OllamaProvider(LLMProvider):
             # Disable thinking for faster structured output
             "think": False,
         }
+        # Ollama supports format: "json" for JSON mode
+        if json_mode:
+            payload["format"] = "json"
 
         logger.info("Ollama request: model=%s, prompt_len=%d", self.model, len(prompt))
         t0 = time.time()
@@ -203,6 +214,7 @@ class AnthropicProvider(LLMProvider):
         system: str = "",
         max_tokens: int = 2048,
         temperature: float = 0.0,
+        json_mode: bool = False,
     ) -> str:
         import anthropic
 
@@ -230,6 +242,112 @@ class AnthropicProvider(LLMProvider):
         elapsed = time.time() - t0
         content = message.content[0].text
         logger.info("Anthropic response: %d chars in %.2fs", len(content), elapsed)
+        return content
+
+
+# ---------------------------------------------------------------------------
+# Gemini provider
+# ---------------------------------------------------------------------------
+
+class GeminiProvider(LLMProvider):
+    """Google Gemini backend — requires GEMINI_API_KEY.
+
+    Uses the official google-genai SDK with native structured JSON output.
+    Recommended model: gemini-2.5-flash (fast, cheap, strong JSON mode).
+    """
+
+    def __init__(self, api_key: str = "", model: str = "gemini-2.5-flash"):
+        self.api_key = api_key
+        self.model = model
+
+    def is_available(self) -> bool:
+        if not self.api_key:
+            return False
+        try:
+            from google import genai  # noqa: F401
+            return True
+        except ImportError:
+            return False
+
+    def provider_info(self) -> dict:
+        return {
+            "provider": "gemini",
+            "model": self.model,
+            "requires_api_key": True,
+            "description": f"Google Gemini ({self.model})",
+        }
+
+    def complete(
+        self,
+        prompt: str,
+        system: str = "",
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        json_mode: bool = False,
+    ) -> str:
+        from google import genai
+
+        if not self.api_key:
+            raise EnvironmentError("GEMINI_API_KEY is not set")
+
+        client = genai.Client(api_key=self.api_key)
+
+        contents = []
+        if system:
+            contents.append(genai.types.Content(
+                role="user",
+                parts=[genai.types.Part.from_text(f"[System instruction: {system}]\n\n{prompt}")],
+            ))
+        else:
+            contents.append(genai.types.Content(
+                role="user",
+                parts=[genai.types.Part.from_text(prompt)],
+            ))
+
+        config = genai.types.GenerateContentConfig(
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+        # Request structured JSON output when the caller needs it.
+        if json_mode:
+            config.response_mime_type = "application/json"
+
+        logger.info("Gemini request: model=%s, prompt_len=%d, json_mode=%s", self.model, len(prompt), json_mode)
+        t0 = time.time()
+
+        try:
+            response = client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            elapsed = time.time() - t0
+            error_msg = str(e)
+            # Classify common errors
+            if "API_KEY_INVALID" in error_msg or "invalid api key" in error_msg.lower():
+                raise ValueError(f"Gemini API error: invalid API key")
+            if "quota" in error_msg.lower() or "rate" in error_msg.lower():
+                raise ValueError(f"Gemini API error: quota/rate limit exceeded")
+            if "timeout" in error_msg.lower() or "deadline" in error_msg.lower():
+                raise ValueError(f"Gemini request timed out after {elapsed:.0f}s")
+            raise ValueError(f"Gemini API error: {error_msg}")
+
+        elapsed = time.time() - t0
+
+        if not response.candidates:
+            raise ValueError("Gemini returned no candidates")
+
+        parts = response.candidates[0].content.parts
+        if not parts:
+            raise ValueError("Gemini returned empty response (no parts)")
+
+        content = parts[0].text
+        if not content:
+            raise ValueError("Gemini returned empty text in response")
+
+        logger.info("Gemini response: %d chars in %.2fs", len(content), elapsed)
         return content
 
 
@@ -270,6 +388,7 @@ class OpenRouterProvider(LLMProvider):
         system: str = "",
         max_tokens: int = 2048,
         temperature: float = 0.0,
+        json_mode: bool = False,
     ) -> str:
         import httpx
 
@@ -287,6 +406,12 @@ class OpenRouterProvider(LLMProvider):
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
+
+        # Request structured JSON output when the model supports it.
+        # Not all models/endpoints honour this, so we still parse
+        # and validate the response ourselves.
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
 
         headers = {
             "Authorization": f"Bearer {self.api_key}",
@@ -380,7 +505,7 @@ _provider_instance: Optional[LLMProvider] = None
 def get_provider() -> LLMProvider:
     """Auto-select and cache the best available provider.
 
-    Priority: Ollama (local/free) > OpenRouter (cloud) > Anthropic (cloud).
+    Priority: Ollama (local/free) > Gemini (cloud) > OpenRouter (cloud) > Anthropic (cloud).
     """
     global _provider_instance
     if _provider_instance is not None:
@@ -395,10 +520,20 @@ def get_provider() -> LLMProvider:
         _provider_instance = ollama
         return _provider_instance
 
+    # Try Gemini if API key is present (preferred cloud provider)
+    gemini_key = os.environ.get("GEMINI_API_KEY", "")
+    if gemini_key:
+        gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        gemini = GeminiProvider(api_key=gemini_key, model=gemini_model)
+        if gemini.is_available():
+            logger.info("Using Gemini provider (model=%s)", gemini_model)
+            _provider_instance = gemini
+            return _provider_instance
+
     # Try OpenRouter if API key is present
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
     if openrouter_key:
-        openrouter_model = os.environ.get("OPENROUTER_MODEL", "openrouter/free")
+        openrouter_model = os.environ.get("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
         openrouter_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         openrouter = OpenRouterProvider(
             api_key=openrouter_key,
@@ -422,8 +557,9 @@ def get_provider() -> LLMProvider:
     raise EnvironmentError(
         "No LLM provider available. Either:\n"
         "  1. Start Ollama with a model: ollama serve && ollama pull qwen3.5\n"
-        "  2. Set OPENROUTER_API_KEY environment variable.\n"
-        "  3. Set ANTHROPIC_API_KEY environment variable.\n"
+        "  2. Set GEMINI_API_KEY environment variable (recommended for production).\n"
+        "  3. Set OPENROUTER_API_KEY environment variable.\n"
+        "  4. Set ANTHROPIC_API_KEY environment variable.\n"
         "Use seeded demo data for offline operation."
     )
 
