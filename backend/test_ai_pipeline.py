@@ -1312,7 +1312,7 @@ class TestGeminiProvider:
 
     def test_structured_parsed_response(self):
         """When response.parsed is available (native structured output),
-        use it directly instead of parsing response.text."""
+        complete() returns the dict directly — no json.dumps round-trip."""
         from ai.llm_provider import ExtractionSchema
 
         provider = GeminiProvider(api_key="test-key")
@@ -1332,12 +1332,13 @@ class TestGeminiProvider:
             result = provider.complete(
                 "test", json_mode=True, response_schema=ExtractionSchema,
             )
-            parsed = json.loads(result)
-            assert "facts" in parsed
-            assert parsed["facts"][0]["fact_type"] == "order_detail"
+            # complete() returns a dict directly — no text round-trip
+            assert isinstance(result, dict)
+            assert "facts" in result
+            assert result["facts"][0]["fact_type"] == "order_detail"
 
     def test_structured_parsed_pydantic_model(self):
-        """When response.parsed is a Pydantic model, serialize via model_dump()."""
+        """When response.parsed is a Pydantic model, complete() returns model_dump() dict."""
         from ai.llm_provider import ReasoningSchema
 
         provider = GeminiProvider(api_key="test-key")
@@ -1362,9 +1363,10 @@ class TestGeminiProvider:
             result = provider.complete(
                 "test", json_mode=True, response_schema=ReasoningSchema,
             )
-            parsed = json.loads(result)
-            assert parsed["classification"] == "clear"
-            assert parsed["confidence"] == 0.9
+            # complete() returns a dict via model_dump() — no text round-trip
+            assert isinstance(result, dict)
+            assert result["classification"] == "clear"
+            assert result["confidence"] == 0.9
 
     def test_fallback_to_text_when_parsed_is_none(self):
         """When response.parsed is None, fall back to response.text."""
@@ -1413,3 +1415,123 @@ class TestGeminiProvider:
             # Verify response_schema was passed in config
             call_kwargs_config = mock_genai.types.GenerateContentConfig.call_args[1]
             assert call_kwargs_config.get("response_schema") == ExtractionSchema
+
+    def test_complete_json_native_dict_passthrough(self):
+        """complete_json passes through a dict from complete() without re-parsing."""
+        from ai.llm_provider import ExtractionSchema
+
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        # response.parsed returns a dict → complete() returns a dict
+        expected = {"facts": [{"fact_type": "order_detail", "value": "y", "evidence_quote": "q"}]}
+        mock_response = Mock()
+        mock_response.parsed = expected
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete_json("test", response_schema=ExtractionSchema)
+            # Must be a dict, not a re-parsed string
+            assert isinstance(result, dict)
+            assert result == expected
+
+    def test_complete_json_native_pydantic_passthrough(self):
+        """complete_json converts Pydantic model via model_dump() without round-trip."""
+        from ai.llm_provider import ReasoningSchema
+
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_parsed = ReasoningSchema(
+            claims=[], classification="clear", confidence=0.8, reasoning_summary="ok"
+        )
+        mock_response = Mock()
+        mock_response.parsed = mock_parsed
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete_json("test", response_schema=ReasoningSchema)
+            assert isinstance(result, dict)
+            assert result["classification"] == "clear"
+            assert result["confidence"] == 0.8
+
+    def test_complete_json_text_fallback(self):
+        """When complete() returns raw text, complete_json() parses it."""
+        provider = GeminiProvider(api_key="test-key")
+
+        json_text = '{"facts": [{"fact_type": "order_detail", "value": "x", "evidence_quote": "q"}]}'
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_part = Mock()
+        mock_part.text = json_text
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.parsed = None
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete_json("test")
+            assert isinstance(result, dict)
+            assert "facts" in result
+
+    def test_complete_json_malformed_text_still_rejected(self):
+        """Malformed text from complete() must still be rejected."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_part = Mock()
+        mock_part.text = "This is not JSON at all"
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.parsed = None
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            with pytest.raises(ValueError, match="Failed to parse JSON"):
+                provider.complete_json("test")
+
+    def test_complete_json_gemini_safety_text_rejected(self):
+        """Gemini safety response text must NOT be accepted as valid JSON."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        # Simulate the "User Safety: safe..." response that started this investigation
+        mock_part = Mock()
+        mock_part.text = "User Safety: safe. The request does not violate any safety policies."
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.parsed = None
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            with pytest.raises(ValueError, match="Failed to parse JSON"):
+                provider.complete_json("test")
+
+class TestAnthropicProvider:
+    pass

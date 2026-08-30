@@ -69,8 +69,13 @@ class LLMProvider(ABC):
         temperature: float = 0.0,
         json_mode: bool = False,
         response_schema=None,
-    ) -> str:
-        """Send a prompt and return the raw text response.
+    ):
+        """Send a prompt and return the response.
+
+        Returns a ``str`` for most providers.  Providers with native
+        structured output (e.g. Gemini with *response_schema*) may
+        return a ``dict`` or Pydantic model — callers should handle
+        both cases.
 
         When *json_mode* is True the provider should request structured
         JSON output from the model (e.g. response_format).
@@ -104,13 +109,23 @@ class LLMProvider(ABC):
         Requests json_mode from the provider when supported.  If
         *response_schema* is a Pydantic model, providers with native
         structured output will use it to guarantee valid JSON.
+
+        When the provider returns an already-parsed dict (e.g. Gemini
+        with response.parsed), it is passed through directly — no
+        redundant text→dict round-trip.
         """
-        raw = self.complete(
+        result = self.complete(
             prompt, system=system, max_tokens=max_tokens,
             temperature=temperature, json_mode=True,
             response_schema=response_schema,
         )
-        return _parse_json_response(raw)
+        # Native structured output providers (Gemini) return a dict/model
+        # directly — skip the fragile string→JSON round-trip.
+        if isinstance(result, dict):
+            return result
+        if hasattr(result, "model_dump"):
+            return result.model_dump()
+        return _parse_json_response(result)
 
 
 # ---------------------------------------------------------------------------
@@ -387,17 +402,29 @@ class GeminiProvider(LLMProvider):
         # a response_schema was used.  Fall back to response.text.
         parsed = getattr(response, "parsed", None)
         if parsed is not None:
-            # response.parsed is already a dict or Pydantic model
+            # Return the native structured object directly — no redundant
+            # json.dumps round-trip.  complete_json() handles both dicts
+            # and Pydantic models.
             if hasattr(parsed, "model_dump"):
-                content = json.dumps(parsed.model_dump())
+                result = parsed.model_dump()
+                logger.info(
+                    "Gemini response (structured): %d keys in %.2fs",
+                    len(result), elapsed,
+                )
+                return result
             elif isinstance(parsed, dict):
-                content = json.dumps(parsed)
+                logger.info(
+                    "Gemini response (dict): %d keys in %.2fs",
+                    len(parsed), elapsed,
+                )
+                return parsed
             else:
                 content = str(parsed)
-            logger.info(
-                "Gemini response (parsed): %d chars in %.2fs", len(content), elapsed,
-            )
-            return content
+                logger.info(
+                    "Gemini response (parsed→str): %d chars in %.2fs",
+                    len(content), elapsed,
+                )
+                return content
 
         # Fallback: extract from response.text (raw JSON string)
         if not response.candidates:
