@@ -216,7 +216,7 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
         # independent of linked_decision_ids (which may reference a
         # deterministic Razorpay decision).
         cursor_ev = await db.execute(
-            "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = 0",
+            "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = FALSE",
             (user.tenant_id,),
         )
         ev_rows = await cursor_ev.fetchall()
@@ -293,7 +293,7 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                 )
                 # Mark evidence as analyzed by AI so it is not reprocessed.
                 await db.execute(
-                    "UPDATE evidence SET ai_analyzed = 1 WHERE evidence_id = ?",
+                    "UPDATE evidence SET ai_analyzed = TRUE WHERE evidence_id = ?",
                     (ev_result["evidence_id"],),
                 )
 

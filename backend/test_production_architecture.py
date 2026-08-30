@@ -386,9 +386,9 @@ class TestAiAnalyzedArchitecture:
             )
             await db.commit()
 
-            # Query with the ai_analyzed=0 filter (same as run_scenario uses)
+            # Query with the ai_analyzed=FALSE filter (same as run_scenario uses)
             cursor = await db.execute(
-                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = 0",
+                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = FALSE",
                 ("demo",),
             )
             rows = await cursor.fetchall()
@@ -420,13 +420,13 @@ class TestAiAnalyzedArchitecture:
             await db.commit()
 
             cursor = await db.execute(
-                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = 0",
+                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = FALSE",
                 ("demo",),
             )
             rows = await cursor.fetchall()
             evidence_ids = [r["evidence_id"] if hasattr(r, "keys") else r[0] for r in rows]
             assert "ev_already_ai_analyzed" not in evidence_ids, \
-                "Evidence with ai_analyzed=1 must be excluded from scenario runner"
+                "Evidence with ai_analyzed=TRUE must be excluded from scenario runner"
         finally:
             await db.close()
 
@@ -459,11 +459,11 @@ class TestAiAnalyzedArchitecture:
             )
             row = await cursor.fetchone()
             val = row["ai_analyzed"] if hasattr(row, "keys") else row[0]
-            assert val == 0 or val is False, "Fresh evidence must start with ai_analyzed=0"
+            assert val == 0 or val is False, "Fresh evidence must start with ai_analyzed=FALSE"
 
             # Simulate what run_scenario does after pipeline success
             await db.execute(
-                "UPDATE evidence SET ai_analyzed = 1 WHERE evidence_id = ?",
+                "UPDATE evidence SET ai_analyzed = TRUE WHERE evidence_id = ?",
                 ("ev_to_be_analyzed",),
             )
             await db.commit()
@@ -475,7 +475,7 @@ class TestAiAnalyzedArchitecture:
             )
             row = await cursor.fetchone()
             val = row["ai_analyzed"] if hasattr(row, "keys") else row[0]
-            assert val == 1 or val is True, "Evidence must be marked ai_analyzed=1 after processing"
+            assert val == 1 or val is True, "Evidence must be marked ai_analyzed=TRUE after processing"
         finally:
             await db.close()
 
@@ -501,9 +501,9 @@ class TestAiAnalyzedArchitecture:
             )
             await db.commit()
 
-            # The scenario runner query: ai_analyzed = 0
+            # The scenario runner query: ai_analyzed = FALSE
             cursor = await db.execute(
-                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = 0",
+                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = FALSE",
                 ("demo",),
             )
             rows = await cursor.fetchall()
@@ -555,7 +555,7 @@ class TestAiAnalyzedArchitecture:
             )
             # Mark as AI-analyzed
             await db.execute(
-                "UPDATE evidence SET ai_analyzed = 1 WHERE evidence_id = ?",
+                "UPDATE evidence SET ai_analyzed = TRUE WHERE evidence_id = ?",
                 ("ev_razorpay_preserved",),
             )
             await db.commit()
@@ -606,7 +606,7 @@ class TestAiAnalyzedArchitecture:
             row = await cursor.fetchone()
             val = row["ai_analyzed"] if hasattr(row, "keys") else row[0]
             assert val == 0 or val is False, \
-                f"New evidence must default ai_analyzed to 0/False, got {val}"
+                f"New evidence must default ai_analyzed to FALSE, got {val}"
         finally:
             await db.close()
 
@@ -635,7 +635,7 @@ class TestAiAnalyzedArchitecture:
 
             # This is the exact query run_scenario uses
             cursor = await db.execute(
-                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = 0",
+                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = FALSE",
                 ("demo",),
             )
             rows = await cursor.fetchall()
