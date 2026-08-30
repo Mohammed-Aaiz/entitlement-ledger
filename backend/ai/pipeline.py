@@ -253,6 +253,7 @@ def run_pipeline(
         "approver_id": "ai_pipeline",
         "approved_at": None,  # Not approved yet - REVIEW_REQUIRED
         "model_output": {
+            "scenario_id": scenario_id,
             "claims": reasoning_result["claims"],
             "classification": reasoning_result["classification"],
             "confidence": reasoning_result["confidence"],
@@ -302,12 +303,34 @@ def run_pipeline(
 
 
 def _extract_seller_id(evidence_records: list[dict]) -> str:
-    """Extract seller ID from order evidence."""
+    """Extract entity ID from evidence records.
+
+    Tries in order:
+    1. seller_id from order evidence
+    2. razorpay_entity_id (e.g. order_TVtOb7uZcvSkvY) from any evidence
+    3. "unknown" if nothing found
+    """
     for ev in evidence_records:
         if ev["source_type"] == "order":
             try:
                 content = json.loads(ev["raw_content"])
-                return content.get("seller_id", "unknown")
+                # Prefer seller_id if present
+                seller_id = content.get("seller_id")
+                if seller_id:
+                    return seller_id
+                # Fall back to Razorpay entity ID (order ID, payment ID, etc.)
+                entity_id = content.get("razorpay_entity_id", "")
+                if entity_id:
+                    return entity_id
             except (json.JSONDecodeError, KeyError):
                 continue
+    # Try any evidence source for razorpay_entity_id
+    for ev in evidence_records:
+        try:
+            content = json.loads(ev["raw_content"])
+            entity_id = content.get("razorpay_entity_id", "")
+            if entity_id:
+                return entity_id
+        except (json.JSONDecodeError, KeyError):
+            continue
     return "unknown"

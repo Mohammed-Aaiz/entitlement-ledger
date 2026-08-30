@@ -249,6 +249,80 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
         prev_row = await cursor_hash.fetchone()
         prev_hash = prev_row["decision_hash"] if prev_row else "genesis"
 
+        # Idempotency check: if an AI decision already exists for this
+        # tenant + scenario + evidence set + policy set, return it instead
+        # of creating a duplicate.
+        current_evidence_ids = sorted(ev["evidence_id"] for ev in evidence_records)
+        current_policy_ids = sorted(p["policy_id"] for p in policy_records)
+        idempotency_key = (scenario_id, tuple(current_evidence_ids), tuple(current_policy_ids))
+
+        # Find candidate AI decisions for this tenant
+        cursor_existing = await db.execute(
+            "SELECT decision_id, model_output, policy_version_id FROM decisions "
+            "WHERE tenant_id = ? AND approver_id = 'ai_pipeline' "
+            "ORDER BY created_at DESC",
+            (user.tenant_id,),
+        )
+        existing_rows = await cursor_existing.fetchall()
+
+        # Fetch all evidence for this tenant to resolve linked_decision_ids
+        cursor_all_ev = await db.execute(
+            "SELECT evidence_id, linked_decision_ids FROM evidence WHERE tenant_id = ?",
+            (user.tenant_id,),
+        )
+        all_ev_rows = await cursor_all_ev.fetchall()
+        # Build decision_id -> set(evidence_id) mapping
+        dec_to_evidence: dict[str, list[str]] = {}
+        for ev_row in all_ev_rows:
+            ev_id = ev_row["evidence_id"] if hasattr(ev_row, "keys") else ev_row[0]
+            linked_raw = ev_row["linked_decision_ids"] if hasattr(ev_row, "keys") else ev_row[1]
+            linked_ids = _parse_json_field(linked_raw)
+            if not isinstance(linked_ids, list):
+                linked_ids = []
+            for dec_id in linked_ids:
+                dec_to_evidence.setdefault(dec_id, []).append(ev_id)
+
+        for ex_row in existing_rows:
+            ex_decision_id = ex_row["decision_id"]
+            ex_model_output = _parse_json_field(ex_row["model_output"])
+            ex_policy_raw = ex_row["policy_version_id"] or ""
+            ex_policy_ids = sorted(
+                p.strip() for p in ex_policy_raw.split(",") if p.strip()
+            )
+            ex_evidence_ids = sorted(dec_to_evidence.get(ex_decision_id, []))
+
+            # Use the scenario_id persisted on the existing decision,
+            # NOT the current request's scenario_id, to prevent false
+            # positive matches when the same evidence is run under
+            # a different scenario.
+            ex_scenario_id = (
+                ex_model_output.get("scenario_id")
+                if isinstance(ex_model_output, dict)
+                else None
+            )
+            ex_key = (ex_scenario_id, tuple(ex_evidence_ids), tuple(ex_policy_ids))
+            if ex_key == idempotency_key:
+                logger.info(
+                    "Reusing existing AI decision %s for scenario %s (idempotent)",
+                    ex_decision_id, scenario_id,
+                )
+                cursor_dec = await db.execute(
+                    "SELECT * FROM decisions WHERE decision_id = ?",
+                    (ex_decision_id,),
+                )
+                dec_row = await cursor_dec.fetchone()
+                if dec_row:
+                    existing_decision = _row_to_decision(dec_row)
+                    existing_decision["tenant_id"] = user.tenant_id
+                    return {
+                        "status": "completed",
+                        "scenario_id": scenario_id,
+                        "decision_id": ex_decision_id,
+                        "decision_status": existing_decision["status"],
+                        "classification": ex_model_output.get("classification", "unknown") if isinstance(ex_model_output, dict) else "unknown",
+                        "message": f"Existing AI decision {ex_decision_id} already covers this evidence set.",
+                    }
+
         try:
             result = run_pipeline(
                 scenario_id=scenario_id,

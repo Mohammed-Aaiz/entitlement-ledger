@@ -24,6 +24,11 @@ REASONING_SYSTEM = (
     "- You MUST explain your reasoning clearly.\n"
     "- If evidence is insufficient, say so — do NOT invent deductions.\n"
     "- Classification must be one of: \"clear\", \"exception\", \"ambiguous\".\n"
+    "FEE DISTINCTION (CRITICAL):\n"
+    "- Observed transaction/payment processing fees (e.g. Razorpay fees) are NOT policy fees.\n"
+    "- Platform policy fees are calculated deterministically from gross amounts and policy rates.\n"
+    "- Do NOT use observed payment-processing fee amounts as platform fee amounts.\n"
+    "- A platform_fee claim must reference the PLATFORM policy, not a payment processing fee.\n"
     "Return ONLY valid JSON, no explanation text."
 )
 
@@ -55,7 +60,14 @@ IMPORTANT:
 - classification "exception" = special circumstances requiring review
 - classification "ambiguous" = insufficient or contradictory evidence
 - confidence must be between 0.0 and 1.0
-- Return ONLY the JSON object, no markdown fences or explanation."""
+- Return ONLY the JSON object, no markdown fences or explanation.
+
+FEE DISTINCTION RULES:
+- Observed payment-processing fees (e.g. Razorpay transaction fees) are FACTS about what happened, NOT policy-derived amounts.
+- Platform policy fees are CALCULATED from gross amounts and policy rates by deterministic code.
+- If evidence mentions a payment-processing fee, record it as an observed fact but do NOT use its amount for platform_fee claims.
+- A platform_fee claim must reference the platform policy clause and order evidence, not payment-processing fee evidence.
+- The deterministic calculation engine determines all monetary amounts — the AI never determines amounts."""
 
 
 def validate_reasoning_response(response: dict) -> bool:

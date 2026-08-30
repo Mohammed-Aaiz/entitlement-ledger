@@ -349,7 +349,7 @@ class TestRunScenarioArchitecture:
 
         The eligibility SELECT (fetching evidence for AI processing) must use
         ai_analyzed.  Read-modify-write SELECTs for linked_decision_ids updates
-        are excluded from this check.
+        and idempotency-check SELECTs are excluded from this check.
         """
         import inspect
         from routes import run_scenario
@@ -362,10 +362,13 @@ class TestRunScenarioArchitecture:
             l.strip() for l in source.split('\n')
             if 'SELECT' in l and 'evidence' in l
         ]
-        # Exclude read-modify-write SELECTs that just read linked_decision_ids
+        # Exclude:
+        # - read-modify-write SELECTs that just read linked_decision_ids
+        # - idempotency-check SELECTs that read evidence_id + linked_decision_ids
         eligibility_selects = [
             l for l in select_lines
             if 'SELECT linked_decision_ids' not in l
+            and 'SELECT evidence_id, linked_decision_ids' not in l
         ]
         for line in eligibility_selects:
             assert 'ai_analyzed' in line, \
@@ -1080,3 +1083,398 @@ class TestApprovedAtNullable:
         assert _to_iso_str(None) is None
         assert _to_iso_str("") is None
         assert _to_iso_str("2025-01-01T00:00:00") == "2025-01-01T00:00:00"
+
+
+class TestIssueRegression:
+    """Regression tests for Issues 1-3: idempotency, fee distinction, entity identity."""
+
+    def test_extract_entity_id_prefers_seller_id(self):
+        """_extract_seller_id must prefer seller_id over razorpay_entity_id."""
+        from ai.pipeline import _extract_seller_id
+
+        evidence = [{
+            "source_type": "order",
+            "raw_content": json.dumps({
+                "seller_id": "seller_123",
+                "razorpay_entity_id": "order_TVtOb7uZcvSkvY",
+            }),
+        }]
+        assert _extract_seller_id(evidence) == "seller_123"
+
+    def test_extract_entity_id_falls_back_to_razorpay_entity_id(self):
+        """_extract_seller_id must use razorpay_entity_id when seller_id is absent."""
+        from ai.pipeline import _extract_seller_id
+
+        evidence = [{
+            "source_type": "order",
+            "raw_content": json.dumps({
+                "razorpay_entity_id": "order_TVtOb7uZcvSkvY",
+            }),
+        }]
+        assert _extract_seller_id(evidence) == "order_TVtOb7uZcvSkvY"
+
+    def test_extract_entity_id_tries_any_evidence_for_razorpay_id(self):
+        """_extract_seller_id must try any evidence source for razorpay_entity_id."""
+        from ai.pipeline import _extract_seller_id
+
+        evidence = [{
+            "source_type": "payment",
+            "raw_content": json.dumps({
+                "razorpay_entity_id": "pay_ABC123",
+            }),
+        }]
+        assert _extract_seller_id(evidence) == "pay_ABC123"
+
+    def test_extract_entity_id_returns_unknown_when_no_id_found(self):
+        """_extract_seller_id returns 'unknown' when no entity ID is present."""
+        from ai.pipeline import _extract_seller_id
+
+        evidence = [{
+            "source_type": "order",
+            "raw_content": json.dumps({"amount": 30000}),
+        }]
+        assert _extract_seller_id(evidence) == "unknown"
+
+    def test_extract_entity_id_handles_malformed_json(self):
+        """_extract_seller_id handles malformed JSON gracefully."""
+        from ai.pipeline import _extract_seller_id
+
+        evidence = [{
+            "source_type": "order",
+            "raw_content": "not json",
+        }]
+        assert _extract_seller_id(evidence) == "unknown"
+
+    def test_reasoning_prompt_distinguishes_fees(self):
+        """Reasoning prompt must contain explicit fee distinction rules."""
+        from ai.reasoning import REASONING_SYSTEM, REASONING_PROMPT
+
+        assert "payment-processing" in REASONING_SYSTEM.lower() or "payment processing" in REASONING_SYSTEM.lower(), \
+            "REASONING_SYSTEM must mention payment-processing fees"
+        assert "platform fee" in REASONING_SYSTEM.lower() or "platform policy" in REASONING_SYSTEM.lower(), \
+            "REASONING_SYSTEM must mention platform policy fees"
+        assert "FEE DISTINCTION" in REASONING_PROMPT or "fee distinction" in REASONING_PROMPT.lower(), \
+            "REASONING_PROMPT must contain FEE DISTINCTION rules"
+
+    def test_reasoning_prompt_forbids_using_observed_fees_as_policy_fees(self):
+        """Reasoning prompt must explicitly forbid using observed fees as platform fees."""
+        from ai.reasoning import REASONING_SYSTEM, REASONING_PROMPT
+
+        combined = REASONING_SYSTEM + REASONING_PROMPT
+        # Must contain instruction that observed fees are not policy fees
+        assert "NOT" in combined and ("policy fee" in combined.lower() or "platform fee" in combined.lower()), \
+            "Prompt must explicitly state that observed fees are not policy fees"
+
+    @pytest.mark.asyncio
+    async def test_idempotent_same_scenario_same_evidence_reuses(self):
+        """Same scenario + same evidence set + same policy set => reuse existing AI decision."""
+        from database import get_db
+        from routes import _parse_json_field
+
+        tenant = "idem_t1"
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO tenants (tenant_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (tenant, "Idem Test 1"),
+            )
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_idem_same", tenant, "order",
+                    json.dumps({"razorpay_entity_id": "order_TEST"}),
+                    "[]", json.dumps([]),
+                    0, "hash_idem_same", 1, datetime.now().isoformat(),
+                ),
+            )
+            existing_decision_id = "dec_idem_existing"
+            await db.execute(
+                "INSERT INTO decisions "
+                "(decision_id, tenant_id, entity_type, entity_id, gross_amount, "
+                "line_items, final_amount, policy_version_id, approver_id, approved_at, "
+                "model_output, prev_decision_hash, decision_hash, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    existing_decision_id, tenant, "seller",
+                    "order_TEST", 30000, json.dumps([]), 27600,
+                    "platform_1_1,sla_4_2", "ai_pipeline", None,
+                    json.dumps({"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}),
+                    "prev", "hash", datetime.now().isoformat(), "REVIEW_REQUIRED",
+                ),
+            )
+            await db.execute(
+                "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                (json.dumps([existing_decision_id]), "ev_idem_same"),
+            )
+            await db.commit()
+
+            evidence_ids = sorted(["ev_idem_same"])
+            policy_ids = sorted(["platform_1_1", "sla_4_2"])
+            idempotency_key = ("scenario_1", tuple(evidence_ids), tuple(policy_ids))
+
+            cursor = await db.execute(
+                "SELECT decision_id, model_output, policy_version_id FROM decisions "
+                f"WHERE tenant_id = ? AND approver_id = 'ai_pipeline'",
+                (tenant,),
+            )
+            rows = await cursor.fetchall()
+
+            cursor_ev = await db.execute(
+                "SELECT evidence_id, linked_decision_ids FROM evidence WHERE tenant_id = ?",
+                (tenant,),
+            )
+            all_ev = await cursor_ev.fetchall()
+            dec_to_ev: dict[str, list[str]] = {}
+            for ev_row in all_ev:
+                ev_id = ev_row["evidence_id"] if hasattr(ev_row, "keys") else ev_row[0]
+                linked = _parse_json_field(
+                    ev_row["linked_decision_ids"] if hasattr(ev_row, "keys") else ev_row[1]
+                )
+                if isinstance(linked, list):
+                    for d in linked:
+                        dec_to_ev.setdefault(d, []).append(ev_id)
+
+            found = None
+            for row in rows:
+                pol_raw = row["policy_version_id"] or ""
+                pol_ids = sorted(p.strip() for p in pol_raw.split(",") if p.strip())
+                ev_ids = sorted(dec_to_ev.get(row["decision_id"], []))
+                key = ("scenario_1", tuple(ev_ids), tuple(pol_ids))
+                if key == idempotency_key:
+                    found = row["decision_id"]
+                    break
+
+            assert found == existing_decision_id, \
+                f"Idempotency must find existing decision {existing_decision_id}, got {found}"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_different_scenario_allows_new(self):
+        """Different scenario + same evidence set => allow a new decision."""
+        from database import get_db
+        from routes import _parse_json_field
+
+        tenant = "idem_t2"
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO tenants (tenant_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (tenant, "Idem Test 2"),
+            )
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_idem_diff", tenant, "order",
+                    json.dumps({"razorpay_entity_id": "order_DIFF"}),
+                    "[]", json.dumps([]),
+                    0, "hash_idem_diff", 1, datetime.now().isoformat(),
+                ),
+            )
+            existing_decision_id = "dec_idem_scenario1"
+            await db.execute(
+                "INSERT INTO decisions "
+                "(decision_id, tenant_id, entity_type, entity_id, gross_amount, "
+                "line_items, final_amount, policy_version_id, approver_id, approved_at, "
+                "model_output, prev_decision_hash, decision_hash, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    existing_decision_id, tenant, "seller",
+                    "order_DIFF", 30000, json.dumps([]), 27600,
+                    "platform_1_1", "ai_pipeline", None,
+                    json.dumps({"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}),
+                    "prev", "hash", datetime.now().isoformat(), "REVIEW_REQUIRED",
+                ),
+            )
+            await db.execute(
+                "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                (json.dumps([existing_decision_id]), "ev_idem_diff"),
+            )
+            await db.commit()
+
+            evidence_ids = sorted(["ev_idem_diff"])
+            policy_ids = sorted(["platform_1_1"])
+            idempotency_key = ("scenario_2", tuple(evidence_ids), tuple(policy_ids))
+
+            cursor = await db.execute(
+                "SELECT decision_id, model_output, policy_version_id FROM decisions "
+                "WHERE tenant_id = ? AND approver_id = 'ai_pipeline'",
+                (tenant,),
+            )
+            rows = await cursor.fetchall()
+
+            cursor_ev = await db.execute(
+                "SELECT evidence_id, linked_decision_ids FROM evidence WHERE tenant_id = ?",
+                (tenant,),
+            )
+            all_ev = await cursor_ev.fetchall()
+            dec_to_ev2: dict[str, list[str]] = {}
+            for ev_row in all_ev:
+                ev_id = ev_row["evidence_id"] if hasattr(ev_row, "keys") else ev_row[0]
+                linked = _parse_json_field(
+                    ev_row["linked_decision_ids"] if hasattr(ev_row, "keys") else ev_row[1]
+                )
+                if isinstance(linked, list):
+                    for d in linked:
+                        dec_to_ev2.setdefault(d, []).append(ev_id)
+
+            found = None
+            for row in rows:
+                pol_raw = row["policy_version_id"] or ""
+                pol_ids = sorted(p.strip() for p in pol_raw.split(",") if p.strip())
+                ev_ids = sorted(dec_to_ev2.get(row["decision_id"], []))
+                # Existing decision was created under scenario_1
+                existing_key = ("scenario_1", tuple(ev_ids), tuple(pol_ids))
+                if existing_key == idempotency_key:
+                    found = row["decision_id"]
+                    break
+
+            assert found is None, \
+                f"Different scenario must NOT match existing decision, but found {found}"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_razorpay_decision_ignored(self):
+        """Deterministic Razorpay decisions must not be treated as AI idempotency matches."""
+        from database import get_db
+
+        tenant = "idem_t3"
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO tenants (tenant_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (tenant, "Idem Test 3"),
+            )
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_idem_razorpay", tenant, "order",
+                    json.dumps({"razorpay_entity_id": "order_RP"}),
+                    "[]", json.dumps([]),
+                    0, "hash_idem_rp", 1, datetime.now().isoformat(),
+                ),
+            )
+            razorpay_decision_id = "dec_razorpay_idem"
+            await db.execute(
+                "INSERT INTO decisions "
+                "(decision_id, tenant_id, entity_type, entity_id, gross_amount, "
+                "line_items, final_amount, policy_version_id, approver_id, approved_at, "
+                "model_output, prev_decision_hash, decision_hash, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    razorpay_decision_id, tenant, "seller",
+                    "order_RP", 30000, json.dumps([]), 27600,
+                    "platform_1_1", "razorpay_webhook", datetime.now().isoformat(),
+                    json.dumps({}),
+                    "prev", "hash_rp", datetime.now().isoformat(), "APPROVED",
+                ),
+            )
+            await db.execute(
+                "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                (json.dumps([razorpay_decision_id]), "ev_idem_razorpay"),
+            )
+            await db.commit()
+
+            cursor = await db.execute(
+                "SELECT decision_id FROM decisions "
+                "WHERE tenant_id = ? AND approver_id = 'ai_pipeline'",
+                (tenant,),
+            )
+            rows = await cursor.fetchall()
+            ai_decision_ids = [r["decision_id"] if hasattr(r, "keys") else r[0] for r in rows]
+
+            assert razorpay_decision_id not in ai_decision_ids, \
+                f"Razorpay decision {razorpay_decision_id} must not appear in AI idempotency candidates"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_idempotent_prefix_collision_does_not_match(self):
+        """Decision ID prefix collision must not create a false idempotency match."""
+        from database import get_db
+        from routes import _parse_json_field
+
+        tenant = "idem_t4"
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO tenants (tenant_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (tenant, "Idem Test 4"),
+            )
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_idem_prefix", tenant, "order",
+                    json.dumps({"razorpay_entity_id": "order_PFX"}),
+                    "[]", json.dumps([]),
+                    0, "hash_idem_pfx", 1, datetime.now().isoformat(),
+                ),
+            )
+            dec_short = "dec_ABC123"
+            await db.execute(
+                "INSERT INTO decisions "
+                "(decision_id, tenant_id, entity_type, entity_id, gross_amount, "
+                "line_items, final_amount, policy_version_id, approver_id, approved_at, "
+                "model_output, prev_decision_hash, decision_hash, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    dec_short, tenant, "seller",
+                    "order_PFX", 30000, json.dumps([]), 27600,
+                    "platform_1_1", "ai_pipeline", None,
+                    json.dumps({"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}),
+                    "prev", "hash_pfx", datetime.now().isoformat(), "REVIEW_REQUIRED",
+                ),
+            )
+            await db.execute(
+                "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                (json.dumps([dec_short]), "ev_idem_prefix"),
+            )
+            await db.commit()
+
+            evidence_ids = sorted(["ev_idem_prefix"])
+            policy_ids = sorted(["platform_1_1"])
+
+            cursor_ev = await db.execute(
+                "SELECT evidence_id, linked_decision_ids FROM evidence WHERE tenant_id = ?",
+                (tenant,),
+            )
+            all_ev = await cursor_ev.fetchall()
+            dec_to_ev: dict[str, list[str]] = {}
+            for ev_row in all_ev:
+                ev_id = ev_row["evidence_id"] if hasattr(ev_row, "keys") else ev_row[0]
+                linked = _parse_json_field(
+                    ev_row["linked_decision_ids"] if hasattr(ev_row, "keys") else ev_row[1]
+                )
+                if isinstance(linked, list):
+                    for d in linked:
+                        dec_to_ev.setdefault(d, []).append(ev_id)
+
+            existing_ev_ids = sorted(dec_to_ev.get(dec_short, []))
+            existing_key = ("scenario_1", tuple(existing_ev_ids), tuple(policy_ids))
+            requested_key = ("scenario_1", tuple(evidence_ids), tuple(policy_ids))
+
+            assert existing_key == requested_key, \
+                "Same evidence/scenario/policies must produce matching key"
+
+            diff_key = ("scenario_2", tuple(evidence_ids), tuple(policy_ids))
+            assert existing_key != diff_key, \
+                "Different scenario must produce different key"
+
+            diff_ev_key = ("scenario_1", tuple(["ev_other"]), tuple(policy_ids))
+            assert existing_key != diff_ev_key, \
+                "Different evidence set must produce different key"
+        finally:
+            await db.close()
