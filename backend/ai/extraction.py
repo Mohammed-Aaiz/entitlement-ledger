@@ -8,7 +8,7 @@ import os
 import logging
 from typing import Optional
 
-from ai.llm_provider import get_provider
+from ai.llm_provider import get_provider, ExtractionSchema
 
 logger = logging.getLogger(__name__)
 
@@ -101,6 +101,7 @@ def extract_facts_from_evidence(
                 system=EXTRACTION_SYSTEM,
                 max_tokens=2048,
                 temperature=0.0,
+                response_schema=ExtractionSchema,
             )
 
             if validate_extraction_response(parsed):

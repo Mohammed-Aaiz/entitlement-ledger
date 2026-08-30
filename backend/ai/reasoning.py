@@ -9,7 +9,7 @@ import os
 import logging
 from typing import Optional
 
-from ai.llm_provider import get_provider
+from ai.llm_provider import get_provider, ReasoningSchema
 
 logger = logging.getLogger(__name__)
 
@@ -139,6 +139,7 @@ def reason_about_claims(
                 system=REASONING_SYSTEM,
                 max_tokens=2048,
                 temperature=0.0,
+                response_schema=ReasoningSchema,
             )
 
             if validate_reasoning_response(parsed):

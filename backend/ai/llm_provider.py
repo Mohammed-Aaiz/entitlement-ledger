@@ -18,7 +18,43 @@ import time
 from abc import ABC, abstractmethod
 from typing import Optional
 
+from pydantic import BaseModel, Field
+
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Structured-output schemas for Gemini native JSON mode
+# ---------------------------------------------------------------------------
+
+class ExtractionFact(BaseModel):
+    """Single extracted fact from evidence."""
+    fact_type: str
+    value: str
+    amount: Optional[float] = None
+    date: Optional[str] = None
+    evidence_quote: str
+
+
+class ExtractionSchema(BaseModel):
+    """Schema for evidence extraction responses."""
+    facts: list[ExtractionFact]
+
+
+class ReasoningClaim(BaseModel):
+    """Single claim from the reasoning step."""
+    claim_type: str
+    policy_clause_id: str
+    evidence_ids: list[str]
+    reasoning: str
+
+
+class ReasoningSchema(BaseModel):
+    """Schema for reasoning responses."""
+    claims: list[ReasoningClaim]
+    classification: str
+    confidence: float
+    reasoning_summary: str
 
 
 class LLMProvider(ABC):
@@ -32,12 +68,16 @@ class LLMProvider(ABC):
         max_tokens: int = 2048,
         temperature: float = 0.0,
         json_mode: bool = False,
+        response_schema=None,
     ) -> str:
         """Send a prompt and return the raw text response.
 
         When *json_mode* is True the provider should request structured
-        JSON output from the model (e.g. response_format).  Providers
-        that do not support this parameter simply ignore it.
+        JSON output from the model (e.g. response_format).
+
+        *response_schema* is an optional Pydantic model or JSON Schema
+        dict.  Providers that support native structured output (e.g.
+        Gemini) use it to constrain the response.  Others ignore it.
         """
         ...
 
@@ -57,13 +97,19 @@ class LLMProvider(ABC):
         system: str = "",
         max_tokens: int = 2048,
         temperature: float = 0.0,
+        response_schema=None,
     ) -> dict:
         """Complete and parse the response as JSON.
 
-        Requests json_mode from the provider when supported and handles
-        markdown code fences automatically.
+        Requests json_mode from the provider when supported.  If
+        *response_schema* is a Pydantic model, providers with native
+        structured output will use it to guarantee valid JSON.
         """
-        raw = self.complete(prompt, system=system, max_tokens=max_tokens, temperature=temperature, json_mode=True)
+        raw = self.complete(
+            prompt, system=system, max_tokens=max_tokens,
+            temperature=temperature, json_mode=True,
+            response_schema=response_schema,
+        )
         return _parse_json_response(raw)
 
 
@@ -144,6 +190,7 @@ class OllamaProvider(LLMProvider):
         max_tokens: int = 2048,
         temperature: float = 0.0,
         json_mode: bool = False,
+        response_schema=None,
     ) -> str:
         import httpx
 
@@ -215,6 +262,7 @@ class AnthropicProvider(LLMProvider):
         max_tokens: int = 2048,
         temperature: float = 0.0,
         json_mode: bool = False,
+        response_schema=None,
     ) -> str:
         import anthropic
 
@@ -284,6 +332,7 @@ class GeminiProvider(LLMProvider):
         max_tokens: int = 2048,
         temperature: float = 0.0,
         json_mode: bool = False,
+        response_schema=None,
     ) -> str:
         from google import genai
 
@@ -293,15 +342,22 @@ class GeminiProvider(LLMProvider):
         client = genai.Client(api_key=self.api_key)
 
         # Build config — system_instruction is a first-class field in the SDK.
-        config = genai.types.GenerateContentConfig(
-            system_instruction=system or None,
-            max_output_tokens=max_tokens,
-            temperature=temperature,
-        )
+        config_kwargs = {
+            "system_instruction": system or None,
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+        }
 
         # Request structured JSON output when the caller needs it.
         if json_mode:
-            config.response_mime_type = "application/json"
+            config_kwargs["response_mime_type"] = "application/json"
+
+        # When a Pydantic schema is provided, Gemini will guarantee valid
+        # JSON conforming to that schema and populate response.parsed.
+        if response_schema is not None:
+            config_kwargs["response_schema"] = response_schema
+
+        config = genai.types.GenerateContentConfig(**config_kwargs)
 
         logger.info("Gemini request: model=%s, prompt_len=%d, json_mode=%s", self.model, len(prompt), json_mode)
         t0 = time.time()
@@ -326,6 +382,24 @@ class GeminiProvider(LLMProvider):
 
         elapsed = time.time() - t0
 
+        # --- Extract the response text ---
+        # Prefer response.parsed (native structured output from SDK) when
+        # a response_schema was used.  Fall back to response.text.
+        parsed = getattr(response, "parsed", None)
+        if parsed is not None:
+            # response.parsed is already a dict or Pydantic model
+            if hasattr(parsed, "model_dump"):
+                content = json.dumps(parsed.model_dump())
+            elif isinstance(parsed, dict):
+                content = json.dumps(parsed)
+            else:
+                content = str(parsed)
+            logger.info(
+                "Gemini response (parsed): %d chars in %.2fs", len(content), elapsed,
+            )
+            return content
+
+        # Fallback: extract from response.text (raw JSON string)
         if not response.candidates:
             raise ValueError("Gemini returned no candidates")
 
@@ -337,7 +411,7 @@ class GeminiProvider(LLMProvider):
         if not content:
             raise ValueError("Gemini returned empty text in response")
 
-        logger.info("Gemini response: %d chars in %.2fs", len(content), elapsed)
+        logger.info("Gemini response (text): %d chars in %.2fs", len(content), elapsed)
         return content
 
 
@@ -379,6 +453,7 @@ class OpenRouterProvider(LLMProvider):
         max_tokens: int = 2048,
         temperature: float = 0.0,
         json_mode: bool = False,
+        response_schema=None,
     ) -> str:
         import httpx
 

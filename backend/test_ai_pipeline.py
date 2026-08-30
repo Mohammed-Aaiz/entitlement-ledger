@@ -1041,12 +1041,13 @@ class TestGeminiProvider:
         mock_genai.Client.return_value = mock_client
         mock_genai.types.GenerateContentConfig.return_value = Mock()
 
-        # Mock the response
+        # Mock the response — parsed=None forces text fallback
         mock_part = Mock()
         mock_part.text = '{"facts": [{"fact_type": "order_detail", "value": "test"}]}'
         mock_candidate = Mock()
         mock_candidate.content.parts = [mock_part]
         mock_response = Mock()
+        mock_response.parsed = None
         mock_response.candidates = [mock_candidate]
         mock_client.models.generate_content.return_value = mock_response
 
@@ -1073,13 +1074,15 @@ class TestGeminiProvider:
         mock_candidate = Mock()
         mock_candidate.content.parts = [mock_part]
         mock_response = Mock()
+        mock_response.parsed = None
         mock_response.candidates = [mock_candidate]
         mock_client.models.generate_content.return_value = mock_response
 
         with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
             provider.complete("test", json_mode=True)
-            # Verify json_mode was set on config
-            assert captured_config.response_mime_type == "application/json"
+            # Verify response_mime_type was passed via kwargs to GenerateContentConfig
+            call_kwargs = mock_genai.types.GenerateContentConfig.call_args[1]
+            assert call_kwargs.get("response_mime_type") == "application/json"
 
     def test_complete_no_json_mode_by_default(self):
         """When json_mode=False, config must NOT have response_mime_type."""
@@ -1097,6 +1100,7 @@ class TestGeminiProvider:
         mock_candidate = Mock()
         mock_candidate.content.parts = [mock_part]
         mock_response = Mock()
+        mock_response.parsed = None
         mock_response.candidates = [mock_candidate]
         mock_client.models.generate_content.return_value = mock_response
 
@@ -1145,6 +1149,7 @@ class TestGeminiProvider:
         mock_genai.types.GenerateContentConfig.return_value = Mock()
 
         mock_response = Mock()
+        mock_response.parsed = None
         mock_response.candidates = []
         mock_client.models.generate_content.return_value = mock_response
 
@@ -1164,6 +1169,7 @@ class TestGeminiProvider:
         mock_candidate = Mock()
         mock_candidate.content.parts = []
         mock_response = Mock()
+        mock_response.parsed = None
         mock_response.candidates = [mock_candidate]
         mock_client.models.generate_content.return_value = mock_response
 
@@ -1185,6 +1191,7 @@ class TestGeminiProvider:
         mock_candidate = Mock()
         mock_candidate.content.parts = [mock_part]
         mock_response = Mock()
+        mock_response.parsed = None
         mock_response.candidates = [mock_candidate]
         mock_client.models.generate_content.return_value = mock_response
 
@@ -1208,6 +1215,7 @@ class TestGeminiProvider:
         mock_candidate = Mock()
         mock_candidate.content.parts = [mock_part]
         mock_response = Mock()
+        mock_response.parsed = None
         mock_response.candidates = [mock_candidate]
         mock_client.models.generate_content.return_value = mock_response
 
@@ -1278,6 +1286,7 @@ class TestGeminiProvider:
         mock_candidate = Mock()
         mock_candidate.content.parts = [mock_part]
         mock_response = Mock()
+        mock_response.parsed = None
         mock_response.candidates = [mock_candidate]
         mock_client.models.generate_content.return_value = mock_response
 
@@ -1300,3 +1309,107 @@ class TestGeminiProvider:
 
             # Verify Part.from_text was never called
             mock_genai.types.Part.from_text.assert_not_called() if hasattr(mock_genai.types.Part, 'from_text') else None
+
+    def test_structured_parsed_response(self):
+        """When response.parsed is available (native structured output),
+        use it directly instead of parsing response.text."""
+        from ai.llm_provider import ExtractionSchema
+
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        # Simulate SDK returning a parsed dict via response.parsed
+        mock_response = Mock()
+        mock_response.parsed = {"facts": [{"fact_type": "order_detail", "value": "test", "evidence_quote": "quote here"}]}
+        mock_response.candidates = []  # Should not be reached
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete(
+                "test", json_mode=True, response_schema=ExtractionSchema,
+            )
+            parsed = json.loads(result)
+            assert "facts" in parsed
+            assert parsed["facts"][0]["fact_type"] == "order_detail"
+
+    def test_structured_parsed_pydantic_model(self):
+        """When response.parsed is a Pydantic model, serialize via model_dump()."""
+        from ai.llm_provider import ReasoningSchema
+
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        # Simulate SDK returning a Pydantic model instance
+        mock_parsed = ReasoningSchema(
+            claims=[],
+            classification="clear",
+            confidence=0.9,
+            reasoning_summary="test",
+        )
+        mock_response = Mock()
+        mock_response.parsed = mock_parsed
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete(
+                "test", json_mode=True, response_schema=ReasoningSchema,
+            )
+            parsed = json.loads(result)
+            assert parsed["classification"] == "clear"
+            assert parsed["confidence"] == 0.9
+
+    def test_fallback_to_text_when_parsed_is_none(self):
+        """When response.parsed is None, fall back to response.text."""
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_part = Mock()
+        mock_part.text = '{"key": "value"}'
+        mock_candidate = Mock()
+        mock_candidate.content.parts = [mock_part]
+        mock_response = Mock()
+        mock_response.parsed = None
+        mock_response.candidates = [mock_candidate]
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete("test")
+            assert result == '{"key": "value"}'
+
+    def test_complete_json_with_schema_passes_to_provider(self):
+        """complete_json must forward response_schema to complete()."""
+        from ai.llm_provider import ExtractionSchema
+
+        provider = GeminiProvider(api_key="test-key")
+
+        mock_genai = Mock()
+        mock_client = Mock()
+        mock_genai.Client.return_value = mock_client
+        mock_genai.types.GenerateContentConfig.return_value = Mock()
+
+        mock_response = Mock()
+        mock_response.parsed = {"facts": [{"fact_type": "order_detail", "value": "x", "evidence_quote": "quote here"}]}
+        mock_client.models.generate_content.return_value = mock_response
+
+        with patch.dict("sys.modules", {"google": Mock(genai=mock_genai), "google.genai": mock_genai}):
+            result = provider.complete_json(
+                "test", response_schema=ExtractionSchema,
+            )
+            assert isinstance(result, dict)
+            assert "facts" in result
+
+            # Verify response_schema was passed in config
+            call_kwargs_config = mock_genai.types.GenerateContentConfig.call_args[1]
+            assert call_kwargs_config.get("response_schema") == ExtractionSchema
