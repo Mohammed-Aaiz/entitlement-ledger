@@ -12,7 +12,7 @@ from ai.pipeline import (
     _validate_policy_references,
     run_pipeline,
 )
-from ai.llm_provider import is_ai_available, reset_provider, get_provider, OpenRouterProvider, GeminiProvider
+from ai.llm_provider import is_ai_available, reset_provider, get_provider, OpenRouterProvider, GeminiProvider, GroqProvider, _pydantic_to_strict_json_schema
 from seed_data import get_all_evidence, get_all_policies, get_scenario_evidence, get_scenario_policies
 
 
@@ -1645,6 +1645,439 @@ class TestGeminiProvider:
             result = provider.complete("test")
             assert isinstance(result, str)
             assert result == raw_text
+
+
+class TestGroqProvider:
+    """Test Groq provider with mocked HTTP responses."""
+
+    def test_is_available_with_key(self):
+        provider = GroqProvider(api_key="test-key")
+        assert provider.is_available() is True
+
+    def test_is_available_without_key(self):
+        provider = GroqProvider(api_key="")
+        assert provider.is_available() is False
+
+    def test_provider_info(self):
+        provider = GroqProvider(api_key="test-key", model="openai/gpt-oss-120b")
+        info = provider.provider_info()
+        assert info["provider"] == "groq"
+        assert info["model"] == "openai/gpt-oss-120b"
+        assert info["requires_api_key"] is True
+
+    def test_complete_raises_without_key(self):
+        provider = GroqProvider(api_key="")
+        with pytest.raises(EnvironmentError, match="GROQ_API_KEY"):
+            provider.complete("test prompt")
+
+    def test_complete_success(self):
+        """Test successful completion with mocked HTTP response."""
+        provider = GroqProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [{
+                "message": {"content": "{\"result\": \"ok\"}"},
+                "finish_reason": "stop",
+            }]
+        }
+
+        with patch("ai.llm_provider.httpx") as mock_httpx:
+            mock_httpx.post.return_value = mock_response
+            mock_httpx.TimeoutException = Exception
+            mock_httpx.RequestError = Exception
+            result = provider.complete("test prompt", system="You are helpful")
+            assert isinstance(result, str)
+            mock_httpx.post.assert_called_once()
+
+    def test_complete_structured_output_returns_dict(self):
+        """When response_schema is provided with json_mode, strict structured
+        output is used and the response is parsed to a dict."""
+        from ai.llm_provider import ExtractionSchema
+
+        provider = GroqProvider(api_key="test-key")
+
+        structured_json = json.dumps({
+            "facts": [{
+                "fact_type": "order_detail",
+                "value": "test",
+                "amount": None,
+                "date": None,
+                "evidence_quote": "a quote here for validation",
+            }]
+        })
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [{
+                "message": {"content": structured_json},
+                "finish_reason": "stop",
+            }]
+        }
+
+        with patch("ai.llm_provider.httpx") as mock_httpx:
+            mock_httpx.post.return_value = mock_response
+            mock_httpx.TimeoutException = Exception
+            mock_httpx.RequestError = Exception
+            result = provider.complete(
+                "extract", json_mode=True, response_schema=ExtractionSchema,
+            )
+            # Should return a dict, not a string
+            assert isinstance(result, dict)
+            assert "facts" in result
+            assert result["facts"][0]["fact_type"] == "order_detail"
+
+    def test_complete_structured_sends_strict_schema(self):
+        """Verify the request payload contains strict json_schema format."""
+        from ai.llm_provider import ExtractionSchema
+
+        provider = GroqProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [{
+                "message": {"content": '{"facts": []}'},
+                "finish_reason": "stop",
+            }]
+        }
+
+        with patch("ai.llm_provider.httpx") as mock_httpx:
+            mock_httpx.post.return_value = mock_response
+            mock_httpx.TimeoutException = Exception
+            mock_httpx.RequestError = Exception
+            provider.complete(
+                "extract", json_mode=True, response_schema=ExtractionSchema,
+            )
+            call_args = mock_httpx.post.call_args
+            payload = call_args[1]["json"]
+            rf = payload["response_format"]
+            assert rf["type"] == "json_schema"
+            assert rf["json_schema"]["strict"] is True
+            assert rf["json_schema"]["name"] == "ExtractionSchema"
+            # Verify the schema has additionalProperties: false on objects
+            schema = rf["json_schema"]["schema"]
+            assert schema.get("additionalProperties") is False
+            # Verify all fields are required
+            assert "required" in schema
+            assert "facts" in schema["required"]
+
+    def test_complete_json_mode_without_schema(self):
+        """When json_mode=True but no response_schema, sends json_object format."""
+        provider = GroqProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [{
+                "message": {"content": '{"key": "value"}'},
+                "finish_reason": "stop",
+            }]
+        }
+
+        with patch("ai.llm_provider.httpx") as mock_httpx:
+            mock_httpx.post.return_value = mock_response
+            mock_httpx.TimeoutException = Exception
+            mock_httpx.RequestError = Exception
+            provider.complete("test", json_mode=True)
+            call_args = mock_httpx.post.call_args
+            payload = call_args[1]["json"]
+            assert payload["response_format"] == {"type": "json_object"}
+
+    def test_complete_api_error(self):
+        """Test API error handling."""
+        provider = GroqProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 403
+        mock_response.text = "Forbidden"
+
+        with patch("ai.llm_provider.httpx") as mock_httpx:
+            mock_httpx.post.return_value = mock_response
+            mock_httpx.TimeoutException = Exception
+            mock_httpx.RequestError = Exception
+            with pytest.raises(ValueError, match="Groq API error 403"):
+                provider.complete("test")
+
+    def test_complete_empty_choices(self):
+        """Test response with empty choices."""
+        provider = GroqProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"choices": []}
+
+        with patch("ai.llm_provider.httpx") as mock_httpx:
+            mock_httpx.post.return_value = mock_response
+            mock_httpx.TimeoutException = Exception
+            mock_httpx.RequestError = Exception
+            with pytest.raises(ValueError, match="no choices"):
+                provider.complete("test")
+
+    def test_complete_empty_content(self):
+        """Test response with empty content."""
+        provider = GroqProvider(api_key="test-key")
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [{
+                "message": {"content": ""},
+                "finish_reason": "stop",
+            }]
+        }
+
+        with patch("ai.llm_provider.httpx") as mock_httpx:
+            mock_httpx.post.return_value = mock_response
+            mock_httpx.TimeoutException = Exception
+            mock_httpx.RequestError = Exception
+            with pytest.raises(ValueError, match="empty content"):
+                provider.complete("test")
+
+    def test_complete_json_parsing(self):
+        """Test complete_json parses JSON from Groq response."""
+        provider = GroqProvider(api_key="test-key")
+
+        json_response = '{"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}'
+
+        mock_response = Mock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "choices": [{
+                "message": {"content": json_response},
+                "finish_reason": "stop",
+            }]
+        }
+
+        with patch("ai.llm_provider.httpx") as mock_httpx:
+            mock_httpx.post.return_value = mock_response
+            mock_httpx.TimeoutException = Exception
+            mock_httpx.RequestError = Exception
+            result = provider.complete_json("test prompt")
+            assert isinstance(result, dict)
+            assert result["classification"] == "clear"
+
+    def test_factory_selects_groq(self):
+        """Test that factory selects Groq when GROQ_API_KEY is set."""
+        with patch.dict(os.environ, {
+            "GROQ_API_KEY": "test-key",
+            "GROQ_MODEL": "openai/gpt-oss-120b",
+        }, clear=False):
+            reset_provider()
+            try:
+                # Mock Ollama as unavailable
+                with patch("ai.llm_provider.OllamaProvider") as MockOllama:
+                    mock_ollama = Mock()
+                    mock_ollama.is_available.return_value = False
+                    MockOllama.return_value = mock_ollama
+
+                    provider = get_provider()
+                    assert provider.provider_info()["provider"] == "groq"
+            finally:
+                reset_provider()
+                for key in ["GROQ_API_KEY", "GROQ_MODEL"]:
+                    os.environ.pop(key, None)
+
+    def test_factory_prefers_groq_over_gemini(self):
+        """Test that Groq is preferred over Gemini when both keys are present."""
+        with patch.dict(os.environ, {
+            "GROQ_API_KEY": "groq-key",
+            "GEMINI_API_KEY": "gemini-key",
+        }, clear=False):
+            reset_provider()
+            try:
+                with patch("ai.llm_provider.OllamaProvider") as MockOllama:
+                    mock_ollama = Mock()
+                    mock_ollama.is_available.return_value = False
+                    MockOllama.return_value = mock_ollama
+
+                    provider = get_provider()
+                    assert provider.provider_info()["provider"] == "groq"
+            finally:
+                reset_provider()
+                for key in ["GROQ_API_KEY", "GEMINI_API_KEY"]:
+                    os.environ.pop(key, None)
+
+
+class TestSchemaConversion:
+    """Test Pydantic → Groq strict JSON Schema conversion."""
+
+    def test_extraction_schema_strict(self):
+        """ExtractionSchema converts to strict JSON Schema with all fields required."""
+        from ai.llm_provider import ExtractionSchema
+
+        schema = _pydantic_to_strict_json_schema(ExtractionSchema)
+
+        # Top-level object must have additionalProperties: false
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        assert "facts" in schema["required"]
+
+        # Nested ExtractionFact must also be strict
+        fact_schema = schema["properties"]["facts"]["items"]
+        assert fact_schema["type"] == "object"
+        assert fact_schema["additionalProperties"] is False
+        for field in ["fact_type", "value", "evidence_quote"]:
+            assert field in fact_schema["required"]
+
+        # Optional fields must be nullable unions
+        amount_schema = fact_schema["properties"]["amount"]
+        assert "anyOf" in amount_schema
+        types = [item.get("type") for item in amount_schema["anyOf"]]
+        assert "null" in types
+        assert "number" in types
+
+    def test_reasoning_schema_strict(self):
+        """ReasoningSchema converts to strict JSON Schema."""
+        from ai.llm_provider import ReasoningSchema
+
+        schema = _pydantic_to_strict_json_schema(ReasoningSchema)
+
+        assert schema["type"] == "object"
+        assert schema["additionalProperties"] is False
+        for field in ["claims", "classification", "confidence", "reasoning_summary"]:
+            assert field in schema["required"]
+
+        # Nested claim must be strict
+        claim_schema = schema["properties"]["claims"]["items"]
+        assert claim_schema["type"] == "object"
+        assert claim_schema["additionalProperties"] is False
+
+    def test_no_defs_in_output(self):
+        """$defs should be inlined, not left at top level."""
+        from ai.llm_provider import ExtractionSchema
+
+        schema = _pydantic_to_strict_json_schema(ExtractionSchema)
+        assert "$defs" not in schema
+        assert "$ref" not in schema.get("properties", {}).get("facts", {})
+
+    def test_extraction_schema_groq_strict_invariants(self):
+        """Assert ALL Groq strict-mode invariants for ExtractionSchema.
+
+        Groq strict mode requires:
+        - Every object has additionalProperties: false
+        - Every property is listed in required
+        - Optional fields use nullable anyOf unions
+        - No $defs or $ref references remain
+        """
+        from ai.llm_provider import ExtractionSchema
+
+        schema = _pydantic_to_strict_json_schema(ExtractionSchema)
+
+        def _assert_strict_object(s, path="root"):
+            """Recursively verify Groq strict-mode invariants."""
+            if not isinstance(s, dict):
+                return
+
+            if s.get("type") == "object":
+                # Rule 1: additionalProperties must be false
+                assert s.get("additionalProperties") is False, \
+                    f"{path}: additionalProperties must be false, got {s.get('additionalProperties')}"
+
+                props = s.get("properties", {})
+                required = s.get("required", [])
+
+                # Rule 2: every property must be in required
+                for prop_name in props:
+                    assert prop_name in required, \
+                        f"{path}: property '{prop_name}' not in required {required}"
+
+                # Recurse into each property
+                for prop_name, prop_schema in props.items():
+                    _assert_strict_object(prop_schema, f"{path}.{prop_name}")
+
+            # Rule 3: arrays — recurse into items
+            if s.get("type") == "array" and "items" in s:
+                _assert_strict_object(s["items"], f"{path}.items")
+
+            # Rule 4: nullable fields use anyOf with null
+            if "anyOf" in s:
+                types = [item.get("type") for item in s["anyOf"] if isinstance(item, dict)]
+                assert "null" in types, \
+                    f"{path}: anyOf must include null type, got {types}"
+                # Ensure only one non-null type (simple nullable union)
+                non_null = [t for t in types if t != "null"]
+                assert len(non_null) == 1, \
+                    f"{path}: anyOf with null must have exactly one non-null type, got {non_null}"
+                for item in s["anyOf"]:
+                    _assert_strict_object(item, f"{path}.anyOf")
+
+            # Rule 5: no $defs or $ref
+            assert "$defs" not in s, f"{path}: $defs must not appear"
+            assert "$ref" not in s, f"{path}: $ref must not appear"
+
+        _assert_strict_object(schema)
+
+        # Specific field checks for ExtractionSchema
+        fact_items = schema["properties"]["facts"]["items"]
+        # amount must be nullable number
+        amount_schema = fact_items["properties"]["amount"]
+        assert amount_schema["anyOf"] == [{"type": "number"}, {"type": "null"}], \
+            f"amount must be nullable number, got {amount_schema}"
+        # date must be nullable string
+        date_schema = fact_items["properties"]["date"]
+        assert date_schema["anyOf"] == [{"type": "string"}, {"type": "null"}], \
+            f"date must be nullable string, got {date_schema}"
+
+    def test_reasoning_schema_groq_strict_invariants(self):
+        """Assert ALL Groq strict-mode invariants for ReasoningSchema."""
+        from ai.llm_provider import ReasoningSchema
+
+        schema = _pydantic_to_strict_json_schema(ReasoningSchema)
+
+        def _assert_strict_object(s, path="root"):
+            if not isinstance(s, dict):
+                return
+            if s.get("type") == "object":
+                assert s.get("additionalProperties") is False, \
+                    f"{path}: additionalProperties must be false"
+                props = s.get("properties", {})
+                required = s.get("required", [])
+                for prop_name in props:
+                    assert prop_name in required, \
+                        f"{path}: property '{prop_name}' not in required"
+                for prop_name, prop_schema in props.items():
+                    _assert_strict_object(prop_schema, f"{path}.{prop_name}")
+            if s.get("type") == "array" and "items" in s:
+                _assert_strict_object(s["items"], f"{path}.items")
+            if "anyOf" in s:
+                for item in s["anyOf"]:
+                    _assert_strict_object(item, f"{path}.anyOf")
+            assert "$defs" not in s, f"{path}: $defs must not appear"
+            assert "$ref" not in s, f"{path}: $ref must not appear"
+
+        _assert_strict_object(schema)
+
+        # Specific checks
+        claim_items = schema["properties"]["claims"]["items"]
+        assert "evidence_ids" in claim_items["required"]
+        assert claim_items["properties"]["evidence_ids"]["type"] == "array"
+        assert claim_items["properties"]["evidence_ids"]["items"]["type"] == "string"
+
+    def test_response_format_payload_is_strict(self):
+        """Verify the actual payload that would be sent to Groq for ExtractionSchema."""
+        from ai.llm_provider import ExtractionSchema
+
+        schema = _pydantic_to_strict_json_schema(ExtractionSchema)
+        payload_response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "ExtractionSchema",
+                "strict": True,
+                "schema": schema,
+            },
+        }
+        # Must be exactly this structure
+        assert payload_response_format["type"] == "json_schema"
+        assert payload_response_format["json_schema"]["strict"] is True
+        assert payload_response_format["json_schema"]["name"] == "ExtractionSchema"
+        # Schema must satisfy all strict constraints
+        inner = payload_response_format["json_schema"]["schema"]
+        assert inner["additionalProperties"] is False
+        assert "facts" in inner["required"]
+
 
 class TestAnthropicProvider:
     pass

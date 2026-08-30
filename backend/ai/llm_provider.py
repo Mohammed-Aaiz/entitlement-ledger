@@ -2,8 +2,10 @@
 
 Priority order for auto-selection:
 1. Ollama (local, free, no API key)
-2. OpenRouter (cloud, requires OPENROUTER_API_KEY)
-3. Anthropic Claude (requires ANTHROPIC_API_KEY)
+2. Groq (cloud, fast, requires GROQ_API_KEY)
+3. Gemini (cloud, requires GEMINI_API_KEY)
+4. OpenRouter (cloud, requires OPENROUTER_API_KEY)
+5. Anthropic Claude (requires ANTHROPIC_API_KEY)
 
 Usage:
     provider = get_provider()
@@ -17,6 +19,8 @@ import os
 import time
 from abc import ABC, abstractmethod
 from typing import Optional
+
+import httpx  # noqa: E402
 
 from pydantic import BaseModel, Field
 
@@ -479,6 +483,221 @@ class GeminiProvider(LLMProvider):
 
 
 # ---------------------------------------------------------------------------
+# Groq provider
+# ---------------------------------------------------------------------------
+
+
+def _pydantic_to_strict_json_schema(model_class) -> dict:
+    """Convert a Pydantic model to a Groq strict-mode JSON Schema.
+
+    Groq strict mode requires:
+    - All fields in "required"
+    - ``additionalProperties: false`` on every object
+    - Optional fields represented as nullable unions:
+      ``{"anyOf": [{"type": "..."}, {"type": "null"}]}``
+    """
+    raw = model_class.model_json_schema()
+
+    def _make_strict(schema: dict) -> dict:
+        """Recursively enforce Groq strict-mode rules."""
+        if not isinstance(schema, dict):
+            return schema
+
+        s = dict(schema)
+
+        # Handle $ref — resolve it from the top-level $defs
+        if "$ref" in s:
+            ref_name = s["$ref"].rsplit("/", 1)[-1]
+            defs = raw.get("$defs", {})
+            if ref_name in defs:
+                return _make_strict(defs[ref_name])
+            return s
+
+        # Handle allOf (Pydantic wraps single inheritance in allOf)
+        if "allOf" in s and len(s["allOf"]) == 1:
+            return _make_strict(s["allOf"][0])
+
+        # Process object types
+        if s.get("type") == "object":
+            s["additionalProperties"] = False
+            props = s.get("properties", {})
+            required_fields = list(props.keys())
+
+            for prop_name, prop_schema in props.items():
+                props[prop_name] = _make_strict(prop_schema)
+
+            # Ensure all fields are in required
+            s["required"] = required_fields
+
+        # Handle arrays
+        if s.get("type") == "array" and "items" in s:
+            s["items"] = _make_strict(s["items"])
+
+        # Handle optional/nullable fields: convert anyOf with null to
+        # a proper nullable union.
+        if "anyOf" in s:
+            # Check if it's a nullable pattern: one type + null
+            types = [item.get("type") for item in s["anyOf"] if isinstance(item, dict)]
+            if "null" in types and len(types) == 2:
+                non_null = [item for item in s["anyOf"] if item.get("type") != "null"]
+                if len(non_null) == 1:
+                    inner = _make_strict(non_null[0])
+                    s = {"anyOf": [inner, {"type": "null"}]}
+            else:
+                s["anyOf"] = [_make_strict(item) for item in s["anyOf"]]
+
+        return s
+
+    result = _make_strict(raw)
+    # Remove top-level $defs — already inlined
+    result.pop("$defs", None)
+    return result
+
+
+class GroqProvider(LLMProvider):
+    """Groq cloud LLM backend — requires GROQ_API_KEY.
+
+    Uses Groq's OpenAI-compatible API with strict structured output.
+    Recommended model: openai/gpt-oss-120b.
+    """
+
+    def __init__(self, api_key: str = "", model: str = "openai/gpt-oss-120b"):
+        self.api_key = api_key
+        self.model = model
+        self.base_url = "https://api.groq.com/openai/v1"
+
+    def is_available(self) -> bool:
+        return bool(self.api_key)
+
+    def provider_info(self) -> dict:
+        return {
+            "provider": "groq",
+            "model": self.model,
+            "requires_api_key": True,
+            "description": f"Groq ({self.model})",
+        }
+
+    def complete(
+        self,
+        prompt: str,
+        system: str = "",
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        json_mode: bool = False,
+        response_schema=None,
+    ):
+        if not self.api_key:
+            raise EnvironmentError("GROQ_API_KEY is not set")
+
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+
+        payload: dict = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        # Build response_format for structured output.
+        if response_schema is not None and json_mode:
+            # Strict mode: convert Pydantic schema to Groq-compatible JSON Schema.
+            strict_schema = _pydantic_to_strict_json_schema(response_schema)
+            schema_name = getattr(response_schema, "__name__", "response")
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": strict_schema,
+                },
+            }
+        elif json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        logger.info(
+            "Groq request: model=%s, prompt_len=%d, json_mode=%s, has_schema=%s",
+            self.model, len(prompt), json_mode, response_schema is not None,
+        )
+        t0 = time.time()
+
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=60.0,
+            )
+        except httpx.TimeoutException:
+            raise ValueError(f"Groq request timed out after 60s")
+        except httpx.RequestError as e:
+            raise ValueError(f"Groq connection error: {e}")
+
+        elapsed = time.time() - t0
+
+        if resp.status_code != 200:
+            error_body = resp.text[:500]
+            raise ValueError(
+                f"Groq API error {resp.status_code}: {error_body}"
+            )
+
+        data = resp.json()
+        choices = data.get("choices", [])
+        if not choices:
+            raise ValueError("Groq returned no choices")
+
+        message = choices[0].get("message", {})
+        content = message.get("content") or ""
+
+        # Handle refusal (structured output safety)
+        finish_reason = choices[0].get("finish_reason")
+        if finish_reason == "length":
+            logger.warning(
+                "Groq response truncated (finish_reason=length): "
+                "content_len=%d, elapsed=%.2fs",
+                len(content), elapsed,
+            )
+
+        if not content:
+            raise ValueError(
+                f"Groq returned empty content. "
+                f"finish_reason={finish_reason}, "
+                f"response_keys={list(data.keys())}"
+            )
+
+        logger.info(
+            "Groq response: %d chars, finish_reason=%s, elapsed=%.2fs",
+            len(content), finish_reason, elapsed,
+        )
+
+        # When strict structured output was used, the response IS valid JSON
+        # conforming to the schema.  Parse and return as dict to avoid
+        # the redundant json.loads round-trip.
+        if response_schema is not None and json_mode:
+            try:
+                parsed = json.loads(content)
+                logger.info(
+                    "Groq structured response parsed: %d keys",
+                    len(parsed) if isinstance(parsed, dict) else 0,
+                )
+                return parsed
+            except json.JSONDecodeError:
+                # Strict mode should never produce invalid JSON, but be safe.
+                logger.warning(
+                    "Groq strict output not valid JSON (should not happen): "
+                    "first 100 chars: %s",
+                    content[:100],
+                )
+
+        return content
+
+
+# ---------------------------------------------------------------------------
 # OpenRouter provider
 # ---------------------------------------------------------------------------
 
@@ -633,7 +852,7 @@ _provider_instance: Optional[LLMProvider] = None
 def get_provider() -> LLMProvider:
     """Auto-select and cache the best available provider.
 
-    Priority: Ollama (local/free) > Gemini (cloud) > OpenRouter (cloud) > Anthropic (cloud).
+    Priority: Ollama (local/free) > Groq (cloud, fast) > Gemini (cloud) > OpenRouter (cloud) > Anthropic (cloud).
     """
     global _provider_instance
     if _provider_instance is not None:
@@ -648,7 +867,17 @@ def get_provider() -> LLMProvider:
         _provider_instance = ollama
         return _provider_instance
 
-    # Try Gemini if API key is present (preferred cloud provider)
+    # Try Groq if API key is present (preferred cloud provider)
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    if groq_key:
+        groq_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+        groq = GroqProvider(api_key=groq_key, model=groq_model)
+        if groq.is_available():
+            logger.info("Using Groq provider (model=%s)", groq_model)
+            _provider_instance = groq
+            return _provider_instance
+
+    # Try Gemini if API key is present
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if gemini_key:
         gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -685,9 +914,10 @@ def get_provider() -> LLMProvider:
     raise EnvironmentError(
         "No LLM provider available. Either:\n"
         "  1. Start Ollama with a model: ollama serve && ollama pull qwen3.5\n"
-        "  2. Set GEMINI_API_KEY environment variable (recommended for production).\n"
-        "  3. Set OPENROUTER_API_KEY environment variable.\n"
-        "  4. Set ANTHROPIC_API_KEY environment variable.\n"
+        "  2. Set GROQ_API_KEY environment variable (recommended for production).\n"
+        "  3. Set GEMINI_API_KEY environment variable.\n"
+        "  4. Set OPENROUTER_API_KEY environment variable.\n"
+        "  5. Set ANTHROPIC_API_KEY environment variable.\n"
         "Use seeded demo data for offline operation."
     )
 
