@@ -1246,6 +1246,7 @@ class TestGeminiProvider:
         with patch.dict(os.environ, {
             "GEMINI_API_KEY": "gemini-key",
             "OPENROUTER_API_KEY": "openrouter-key",
+            "GROQ_API_KEY": "",  # Clear to prevent env leakage from .env
         }, clear=False):
             reset_provider()
             try:
@@ -1260,7 +1261,7 @@ class TestGeminiProvider:
                         assert provider.provider_info()["provider"] == "gemini"
             finally:
                 reset_provider()
-                for key in ["GEMINI_API_KEY", "OPENROUTER_API_KEY"]:
+                for key in ["GEMINI_API_KEY", "OPENROUTER_API_KEY", "GROQ_API_KEY"]:
                     os.environ.pop(key, None)
 
     def test_no_part_from_text_positional_arg(self):

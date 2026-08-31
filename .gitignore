@@ -28,6 +28,10 @@ venv/
 htmlcov/
 .coverage
 
+# Benchmark generated output
+backend/benchmark_output/
+backend/benchmark_test_output/
+
 # OS
 .DS_Store
 Thumbs.db

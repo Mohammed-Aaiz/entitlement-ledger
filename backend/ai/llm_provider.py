@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from abc import ABC, abstractmethod
 from typing import Optional
 
@@ -267,7 +268,16 @@ def _parse_json_response(text: str) -> dict:
 # ---------------------------------------------------------------------------
 
 class OllamaProvider(LLMProvider):
-    """Local Ollama LLM backend — free, no API key needed."""
+    """Local Ollama LLM backend — free, no API key needed.
+
+    Supports full solo execution of the Finance Controller LLM layer:
+    - complete()
+    - complete_json()
+    - complete_with_tools() (native tool calling)
+    - chat_complete() (multi-turn conversations)
+
+    Intentionally local-only — never used in Vercel production.
+    """
 
     def __init__(
         self,
@@ -294,8 +304,45 @@ class OllamaProvider(LLMProvider):
             "model": self.model,
             "base_url": self.base_url,
             "requires_api_key": False,
-            "description": "Local Ollama — free, offline",
+            "description": "Local Ollama — free, offline (local-only, not for Vercel production)",
         }
+
+    def _ollama_chat(self, messages: list[dict], options: dict = None,
+                     tools: list[dict] = None, format_json: bool = False) -> dict:
+        """Send a chat request to Ollama and return the raw response dict."""
+        import httpx
+
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": False,
+            "options": options or {},
+            "think": False,
+        }
+        if format_json:
+            payload["format"] = "json"
+
+        # Ollama native tool calling — uses OpenAI-compatible tools format
+        if tools:
+            payload["tools"] = tools
+
+        logger.info("Ollama request: model=%s, msgs=%d, tools=%s",
+                    self.model, len(messages), bool(tools))
+        t0 = time.time()
+
+        try:
+            with httpx.Client(timeout=120.0) as client:
+                r = client.post(f"{self.base_url}/api/chat", json=payload)
+                r.raise_for_status()
+        except httpx.TimeoutException:
+            raise ValueError(f"Ollama request timed out after 120s")
+        except httpx.RequestError as e:
+            raise ValueError(f"Ollama connection error: {e}")
+
+        elapsed = time.time() - t0
+        data = r.json()
+        logger.info("Ollama response: elapsed=%.2fs", elapsed)
+        return data
 
     def complete(
         self,
@@ -306,39 +353,106 @@ class OllamaProvider(LLMProvider):
         json_mode: bool = False,
         response_schema=None,
     ) -> str:
-        import httpx
-
         messages = []
         if system:
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "stream": False,
-            "options": {
-                "num_predict": max_tokens,
-                "temperature": temperature,
-            },
-            # Disable thinking for faster structured output
-            "think": False,
+        options = {
+            "num_predict": max_tokens,
+            "temperature": temperature,
         }
-        # Ollama supports format: "json" for JSON mode
-        if json_mode:
-            payload["format"] = "json"
-
-        logger.info("Ollama request: model=%s, prompt_len=%d", self.model, len(prompt))
-        t0 = time.time()
-
-        with httpx.Client(timeout=120.0) as client:
-            r = client.post(f"{self.base_url}/api/chat", json=payload)
-            r.raise_for_status()
-
-        elapsed = time.time() - t0
-        data = r.json()
+        data = self._ollama_chat(messages, options=options, format_json=json_mode)
         content = data.get("message", {}).get("content", "")
-        logger.info("Ollama response: %d chars in %.2fs", len(content), elapsed)
+        logger.info("Ollama complete: %d chars", len(content))
+        return content
+
+    def complete_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str = "auto",
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+    ) -> ToolCallResponse:
+        """Complete with Ollama native tool calling.
+
+        Ollama uses the same OpenAI-compatible tool format:
+        - Send tools=[...] in the request
+        - Response message may contain tool_calls
+        - Parse tool_calls and return as ToolCallResponse
+        """
+        options = {
+            "num_predict": max_tokens,
+            "temperature": temperature,
+        }
+        data = self._ollama_chat(messages, options=options, tools=tools)
+
+        message = data.get("message", {})
+        content = message.get("content")
+        raw_tool_calls = message.get("tool_calls", []) or []
+
+        # Parse tool calls into ToolCallInfo
+        parsed_tool_calls: list[ToolCallInfo] = []
+        for tc in raw_tool_calls:
+            func = tc.get("function", {})
+            func_name = func.get("name", "")
+            args_raw = func.get("arguments", "{}")
+            try:
+                args_dict = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+            except json.JSONDecodeError:
+                args_dict = {}
+            parsed_tool_calls.append(
+                ToolCallInfo(
+                    id=tc.get("id", f"ollama_{func_name}_{uuid.uuid4().hex[:8]}"),
+                    function_name=func_name,
+                    arguments=args_dict,
+                )
+            )
+
+        finish_reason = "tool_calls" if parsed_tool_calls else "stop"
+        logger.info("Ollama tool response: content=%s, tool_calls=%d",
+                    "present" if content else "None", len(parsed_tool_calls))
+
+        return ToolCallResponse(
+            content=content,
+            tool_calls=parsed_tool_calls,
+            finish_reason=finish_reason,
+        )
+
+    def chat_complete(
+        self,
+        messages: list[dict],
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        json_mode: bool = False,
+        response_schema=None,
+    ):
+        """Send a multi-turn message list to Ollama."""
+        # Filter out tool_calls messages — Ollama doesn't accept them in input
+        clean_messages = []
+        for m in messages:
+            clean = {"role": m["role"], "content": m.get("content", "")}
+            if clean["content"]:
+                clean_messages.append(clean)
+
+        options = {
+            "num_predict": max_tokens,
+            "temperature": temperature,
+        }
+        data = self._ollama_chat(clean_messages, options=options, format_json=json_mode)
+        content = data.get("message", {}).get("content", "")
+
+        if json_mode and response_schema is not None:
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                # Try extracting JSON from text
+                try:
+                    return _parse_json_response(content)
+                except ValueError:
+                    pass
+
         return content
 
 
@@ -574,6 +688,241 @@ class GeminiProvider(LLMProvider):
                 )
 
         logger.info("Gemini response (text): %d chars in %.2fs", len(content), elapsed)
+        return content
+
+    def complete_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str = "auto",
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+    ) -> ToolCallResponse:
+        """Complete with Gemini native function calling.
+
+        Gemini supports function declarations via the google-genai SDK.
+        We convert OpenAI-format tool definitions to Gemini's format,
+        send them, and parse the response for function calls.
+        """
+        from google import genai
+
+        if not self.api_key:
+            raise EnvironmentError("GEMINI_API_KEY is not set")
+
+        client = genai.Client(api_key=self.api_key)
+
+        # Convert OpenAI-format tools to Gemini function declarations
+        gemini_tools = []
+        for tool in tools:
+            func = tool.get("function", {})
+            params = func.get("parameters", {})
+            gemini_tools.append(
+                genai.types.Tool(
+                    function_declarations=[
+                        genai.types.FunctionDeclaration(
+                            name=func.get("name", ""),
+                            description=func.get("description", ""),
+                            parameters=genai.types.Schema(
+                                type=genai.types.Type.OBJECT,
+                                properties={
+                                    k: genai.types.Schema(
+                                        type=genai.types.Type.STRING,
+                                        description=v.get("description", ""),
+                                    )
+                                    for k, v in params.get("properties", {}).items()
+                                },
+                                required=params.get("required", []),
+                            ),
+                        )
+                    ]
+                )
+            )
+
+        # Build conversation contents
+        contents = []
+        for m in messages:
+            role = "model" if m["role"] == "assistant" else "user"
+            if m["role"] == "system":
+                continue  # Handled via system_instruction
+            if m["role"] == "tool":
+                role = "user"  # Tool results go as user messages
+            contents.append(genai.types.Content(
+                role=role,
+                parts=[genai.types.Part.from_text(m.get("content", ""))],
+            ))
+
+        config = genai.types.GenerateContentConfig(
+            tools=gemini_tools if gemini_tools else None,
+            max_output_tokens=max_tokens,
+            temperature=temperature,
+        )
+
+        t0 = time.time()
+        try:
+            response = client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            elapsed = time.time() - t0
+            error_msg = str(e)
+            if "429" in error_msg or "rate" in error_msg.lower():
+                raise ValueError(f"Gemini API error 429: rate limit exceeded")
+            if "timeout" in error_msg.lower():
+                raise ValueError(f"Gemini request timed out after {elapsed:.0f}s")
+            raise ValueError(f"Gemini API error: {error_msg}")
+
+        elapsed = time.time() - t0
+
+        # Parse function calls from response
+        parsed_tool_calls: list[ToolCallInfo] = []
+        content_text = None
+
+        if response.candidates:
+            candidate = response.candidates[0]
+            if candidate.content and candidate.content.parts:
+                for part in candidate.content.parts:
+                    if hasattr(part, "function_call") and part.function_call:
+                        fc = part.function_call
+                        args = dict(fc.args) if fc.args else {}
+                        parsed_tool_calls.append(
+                            ToolCallInfo(
+                                id=f"gemini_{fc.name}_{uuid.uuid4().hex[:8]}",
+                                function_name=fc.name,
+                                arguments=args,
+                            )
+                        )
+                    elif hasattr(part, "text") and part.text:
+                        content_text = part.text
+
+        finish_reason = "tool_calls" if parsed_tool_calls else "stop"
+        logger.info(
+            "Gemini tool response: content=%s, tool_calls=%d, elapsed=%.2fs",
+            "present" if content_text else "None",
+            len(parsed_tool_calls), elapsed,
+        )
+
+        return ToolCallResponse(
+            content=content_text,
+            tool_calls=parsed_tool_calls,
+            finish_reason=finish_reason,
+        )
+
+    def chat_complete(
+        self,
+        messages: list[dict],
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        json_mode: bool = False,
+        response_schema=None,
+    ):
+        """Send a multi-turn message list to Gemini."""
+        # Build conversation contents
+        contents = []
+        system_instruction = None
+        for m in messages:
+            if m["role"] == "system":
+                system_instruction = m.get("content", "")
+                continue
+            role = "model" if m["role"] == "assistant" else "user"
+            if m["role"] == "tool":
+                role = "user"
+            contents.append(genai.types.Content(
+                role=role,
+                parts=[genai.types.Part.from_text(m.get("content", ""))],
+            ))
+
+        return self.complete(
+            prompt="",
+            system=system_instruction or "",
+            max_tokens=max_tokens,
+            temperature=temperature,
+            json_mode=json_mode,
+            response_schema=response_schema,
+        ) if not contents else self._gemini_chat_complete(
+            contents, system_instruction, max_tokens, temperature,
+            json_mode, response_schema,
+        )
+
+    def _gemini_chat_complete(
+        self,
+        contents: list,
+        system_instruction: str | None,
+        max_tokens: int,
+        temperature: float,
+        json_mode: bool,
+        response_schema=None,
+    ):
+        """Internal multi-turn chat complete via Gemini SDK."""
+        from google import genai
+
+        if not self.api_key:
+            raise EnvironmentError("GEMINI_API_KEY is not set")
+
+        client = genai.Client(api_key=self.api_key)
+
+        config_kwargs = {
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if system_instruction:
+            config_kwargs["system_instruction"] = system_instruction
+        if json_mode:
+            config_kwargs["response_mime_type"] = "application/json"
+        if response_schema is not None:
+            config_kwargs["response_schema"] = response_schema
+
+        config = genai.types.GenerateContentConfig(**config_kwargs)
+
+        t0 = time.time()
+        try:
+            response = client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            elapsed = time.time() - t0
+            error_msg = str(e)
+            if "429" in error_msg or "rate" in error_msg.lower():
+                raise ValueError(f"Gemini API error 429: rate limit exceeded")
+            if "timeout" in error_msg.lower():
+                raise ValueError(f"Gemini request timed out after {elapsed:.0f}s")
+            raise ValueError(f"Gemini API error: {error_msg}")
+
+        elapsed = time.time() - t0
+
+        parsed = getattr(response, "parsed", None)
+        if parsed is not None:
+            if hasattr(parsed, "model_dump"):
+                return parsed.model_dump()
+            elif isinstance(parsed, dict):
+                return parsed
+            else:
+                return str(parsed)
+
+        if not response.candidates:
+            raise ValueError("Gemini returned no candidates")
+
+        parts = response.candidates[0].content.parts
+        if not parts:
+            raise ValueError("Gemini returned empty response")
+
+        content = parts[0].text
+        if not content:
+            raise ValueError("Gemini returned empty text")
+
+        if json_mode and response_schema is not None:
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                try:
+                    return _parse_json_response(content)
+                except ValueError:
+                    pass
+
+        logger.info("Gemini chat response: %d chars in %.2fs", len(content), elapsed)
         return content
 
 
@@ -1086,6 +1435,50 @@ class OpenRouterProvider(LLMProvider):
 
 
 # ---------------------------------------------------------------------------
+# Provider error classification
+# ---------------------------------------------------------------------------
+
+PROVIDER_ERROR_CATEGORIES = {
+    "provider_error": "General provider failure",
+    "rate_limit": "Rate limit / quota exceeded (429)",
+    "timeout": "Request timed out",
+    "schema_error": "Structured output / schema validation failure",
+    "tool_error": "Tool calling error",
+    "invalid_arguments": "Invalid tool arguments",
+    "unavailable": "Provider not available",
+}
+
+
+def classify_provider_error(error: Exception) -> str:
+    """Classify an exception into a safe failure category."""
+    msg = str(error).lower()
+    if "429" in msg or "rate" in msg or "quota" in msg:
+        return "rate_limit"
+    if "timeout" in msg or "timed out" in msg:
+        return "timeout"
+    if "api_key" in msg or "invalid" in msg or "unauthorized" in msg:
+        return "provider_error"
+    if "connection" in msg or "unreachable" in msg or "refused" in msg:
+        return "unavailable"
+    if "schema" in msg or "json" in msg or "parse" in msg:
+        return "schema_error"
+    return "provider_error"
+
+
+# ---------------------------------------------------------------------------
+# Production provider selection
+# ---------------------------------------------------------------------------
+
+def is_production() -> bool:
+    """Detect if running in Vercel / production environment."""
+    return (
+        os.environ.get("VERCEL") is not None
+        or os.environ.get("PRODUCTION_PROVIDER") is not None
+        or os.environ.get("ENVIRONMENT", "").lower() in ("production", "prod")
+    )
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -1095,22 +1488,67 @@ _provider_instance: Optional[LLMProvider] = None
 def get_provider() -> LLMProvider:
     """Auto-select and cache the best available provider.
 
-    Priority: Ollama (local/free) > Groq (cloud, fast) > Gemini (cloud) > OpenRouter (cloud) > Anthropic (cloud).
+    In production (Vercel): uses explicit PRODUCTION_PROVIDER or falls
+    through to Groq (cloud) > Gemini (cloud) > OpenRouter > Anthropic.
+    NEVER attempts localhost Ollama in production.
+
+    In development: Ollama (local/free) > Groq > Gemini > OpenRouter > Anthropic.
     """
     global _provider_instance
     if _provider_instance is not None:
         return _provider_instance
 
-    # Try Ollama first (local, free, no API key)
+    # --- Production mode: explicit provider, no localhost Ollama ---
+    if is_production():
+        prod_provider = os.environ.get("PRODUCTION_PROVIDER", "groq")
+        logger.info("Production mode: PRODUCTION_PROVIDER=%s", prod_provider)
+
+        if prod_provider == "groq":
+            groq_key = os.environ.get("GROQ_API_KEY", "")
+            groq_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+            groq = GroqProvider(api_key=groq_key, model=groq_model)
+            if groq.is_available():
+                _provider_instance = groq
+                return _provider_instance
+            raise EnvironmentError(
+                "Production provider 'groq' configured but GROQ_API_KEY not set."
+            )
+
+        elif prod_provider == "gemini":
+            gemini_key = os.environ.get("GEMINI_API_KEY", "")
+            gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+            gemini = GeminiProvider(api_key=gemini_key, model=gemini_model)
+            if gemini.is_available():
+                _provider_instance = gemini
+                return _provider_instance
+            raise EnvironmentError(
+                "Production provider 'gemini' configured but GEMINI_API_KEY not set."
+            )
+
+        elif prod_provider == "ollama":
+            raise EnvironmentError(
+                "PRODUCTION_PROVIDER=ollama is not allowed. "
+                "Ollama is intentionally local-only and not part of "
+                "Vercel production deployment."
+            )
+
+        else:
+            raise EnvironmentError(
+                f"Unknown PRODUCTION_PROVIDER: {prod_provider}. "
+                "Valid options: groq, gemini"
+            )
+
+    # --- Development mode: try providers in priority order ---
+    # 1. Ollama (local, free, no API key)
     model_name = os.environ.get("OLLAMA_MODEL", "qwen3.5:latest")
     base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
     ollama = OllamaProvider(base_url=base_url, model=model_name)
     if ollama.is_available():
-        logger.info("Using Ollama provider (model=%s)", model_name)
+        logger.info("Using Ollama provider (model=%s) [development only]", model_name)
         _provider_instance = ollama
         return _provider_instance
 
-    # Try Groq if API key is present (preferred cloud provider)
+    # 2. Groq (cloud, fast, requires GROQ_API_KEY)
     groq_key = os.environ.get("GROQ_API_KEY", "")
     if groq_key:
         groq_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
@@ -1120,7 +1558,7 @@ def get_provider() -> LLMProvider:
             _provider_instance = groq
             return _provider_instance
 
-    # Try Gemini if API key is present
+    # 3. Gemini (cloud, requires GEMINI_API_KEY)
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if gemini_key:
         gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
@@ -1130,7 +1568,7 @@ def get_provider() -> LLMProvider:
             _provider_instance = gemini
             return _provider_instance
 
-    # Try OpenRouter if API key is present
+    # 4. OpenRouter (cloud, requires OPENROUTER_API_KEY)
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
     if openrouter_key:
         openrouter_model = os.environ.get("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
@@ -1144,7 +1582,7 @@ def get_provider() -> LLMProvider:
         _provider_instance = openrouter
         return _provider_instance
 
-    # Fall back to Anthropic if API key is present
+    # 5. Anthropic (cloud, requires ANTHROPIC_API_KEY)
     if os.environ.get("ANTHROPIC_API_KEY"):
         anthropic_model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
         claude = AnthropicProvider(model=anthropic_model)
@@ -1163,6 +1601,25 @@ def get_provider() -> LLMProvider:
         "  5. Set ANTHROPIC_API_KEY environment variable.\n"
         "Use seeded demo data for offline operation."
     )
+
+
+def get_provider_by_name(name: str) -> LLMProvider:
+    """Get a specific provider by name (for benchmark parity tests)."""
+    name = name.lower().strip()
+    if name == "ollama":
+        model_name = os.environ.get("OLLAMA_MODEL", "qwen3.5:latest")
+        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        return OllamaProvider(base_url=base_url, model=model_name)
+    elif name == "groq":
+        groq_key = os.environ.get("GROQ_API_KEY", "")
+        groq_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+        return GroqProvider(api_key=groq_key, model=groq_model)
+    elif name == "gemini":
+        gemini_key = os.environ.get("GEMINI_API_KEY", "")
+        gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        return GeminiProvider(api_key=gemini_key, model=gemini_model)
+    else:
+        raise ValueError(f"Unknown provider: {name}. Valid: ollama, groq, gemini")
 
 
 def reset_provider() -> None:

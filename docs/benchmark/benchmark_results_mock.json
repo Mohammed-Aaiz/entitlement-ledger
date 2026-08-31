@@ -1,0 +1,296 @@
+{
+  "run_id": "bench_859eace3dc00",
+  "dataset_seed": 42,
+  "dataset_version": "1.0",
+  "benchmark_version": "1.0",
+  "model": "mock",
+  "provider": "mock",
+  "started_at": "2026-08-31T12:10:32Z",
+  "completed_at": "2026-08-31T12:10:32Z",
+  "total_cases": 100,
+  "classification": {
+    "correct": 85,
+    "incorrect": 15,
+    "accuracy": 0.85
+  },
+  "decision": {
+    "correctly_approved": 0,
+    "correctly_review_required": 100,
+    "correctly_exception": 0,
+    "false_auto_resolution": 0,
+    "false_auto_resolution_rate": 0.0
+  },
+  "financial": {
+    "exact_matches": 90,
+    "total_calculated": 100,
+    "calculation_accuracy": 0.9
+  },
+  "rates": {
+    "match_rate": 0.85,
+    "auto_resolution_rate": 0.0,
+    "review_rate": 1.0,
+    "exception_rate": 0.0,
+    "calculation_accuracy": 0.9,
+    "audit_completeness": 1.0
+  },
+  "performance": {
+    "throughput_cases_per_sec": 377.36,
+    "total_duration_ms": 265,
+    "latency_avg_ms": 9.0,
+    "latency_p50_ms": 1.0,
+    "latency_p95_ms": 2,
+    "latency_p99_ms": 209
+  },
+  "agent": {
+    "avg_tool_calls": 1.6,
+    "avg_iterations": 2.6,
+    "pct_requiring_tools": 0.8,
+    "pct_resolving_without_tools": 0.2,
+    "tool_success_rate": 1.0,
+    "agent_failure_rate": 0.0,
+    "max_tool_calls": 2,
+    "max_iterations": 3
+  },
+  "idempotency": {
+    "duplicate_decisions": 0
+  },
+  "category_metrics": {
+    "clean_payment": {
+      "total": 20,
+      "correct": 0,
+      "review_required": 20,
+      "exceptions": 0,
+      "match_rate": 0.0
+    },
+    "delivered_on_time": {
+      "total": 15,
+      "correct": 0,
+      "review_required": 15,
+      "exceptions": 0,
+      "match_rate": 0.0
+    },
+    "late_delivery": {
+      "total": 15,
+      "correct": 0,
+      "review_required": 15,
+      "exceptions": 0,
+      "match_rate": 0.0
+    },
+    "partial_delivery": {
+      "total": 10,
+      "correct": 0,
+      "review_required": 10,
+      "exceptions": 0,
+      "match_rate": 0.0
+    },
+    "refund": {
+      "total": 10,
+      "correct": 0,
+      "review_required": 10,
+      "exceptions": 0,
+      "match_rate": 0.0
+    },
+    "return": {
+      "total": 10,
+      "correct": 0,
+      "review_required": 10,
+      "exceptions": 0,
+      "match_rate": 0.0
+    },
+    "missing_delivery": {
+      "total": 5,
+      "correct": 0,
+      "review_required": 5,
+      "exceptions": 0,
+      "match_rate": 0.0
+    },
+    "conflicting_evidence": {
+      "total": 5,
+      "correct": 0,
+      "review_required": 5,
+      "exceptions": 0,
+      "match_rate": 0.0
+    },
+    "fee_mismatch": {
+      "total": 5,
+      "correct": 0,
+      "review_required": 5,
+      "exceptions": 0,
+      "match_rate": 0.0
+    },
+    "duplicate_event": {
+      "total": 5,
+      "correct": 0,
+      "review_required": 5,
+      "exceptions": 0,
+      "match_rate": 0.0
+    }
+  },
+  "exceptions": [
+    {
+      "case_id": "bench_conflicting_evidence_000",
+      "category": "conflicting_evidence",
+      "expected_classification": "ambiguous",
+      "actual_classification": "clear",
+      "expected_final_amount": 73600,
+      "actual_final_amount": 73600,
+      "exception_reason": "Classification mismatch: expected ambiguous, got clear",
+      "decision_id": "dec_3c880749",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_conflicting_evidence_001",
+      "category": "conflicting_evidence",
+      "expected_classification": "ambiguous",
+      "actual_classification": "clear",
+      "expected_final_amount": 23000,
+      "actual_final_amount": 23000,
+      "exception_reason": "Classification mismatch: expected ambiguous, got clear",
+      "decision_id": "dec_637b7269",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_conflicting_evidence_002",
+      "category": "conflicting_evidence",
+      "expected_classification": "ambiguous",
+      "actual_classification": "clear",
+      "expected_final_amount": 69000,
+      "actual_final_amount": 69000,
+      "exception_reason": "Classification mismatch: expected ambiguous, got clear",
+      "decision_id": "dec_6a32538e",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_conflicting_evidence_003",
+      "category": "conflicting_evidence",
+      "expected_classification": "ambiguous",
+      "actual_classification": "clear",
+      "expected_final_amount": 110400,
+      "actual_final_amount": 110400,
+      "exception_reason": "Classification mismatch: expected ambiguous, got clear",
+      "decision_id": "dec_b635cda5",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_conflicting_evidence_004",
+      "category": "conflicting_evidence",
+      "expected_classification": "ambiguous",
+      "actual_classification": "clear",
+      "expected_final_amount": 46000,
+      "actual_final_amount": 46000,
+      "exception_reason": "Classification mismatch: expected ambiguous, got clear",
+      "decision_id": "dec_3732bc64",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_fee_mismatch_000",
+      "category": "fee_mismatch",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 98400,
+      "actual_final_amount": 98400,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_0779a305",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_fee_mismatch_001",
+      "category": "fee_mismatch",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 11000,
+      "actual_final_amount": 11000,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_2eada38c",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_fee_mismatch_002",
+      "category": "fee_mismatch",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 61600,
+      "actual_final_amount": 61600,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_31120bf3",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_fee_mismatch_003",
+      "category": "fee_mismatch",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 57000,
+      "actual_final_amount": 57000,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_091edf02",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_fee_mismatch_004",
+      "category": "fee_mismatch",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 11000,
+      "actual_final_amount": 11000,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_66c7ae6d",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_missing_delivery_000",
+      "category": "missing_delivery",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 73600,
+      "actual_final_amount": 73600,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_234564cd",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_missing_delivery_001",
+      "category": "missing_delivery",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 184000,
+      "actual_final_amount": 184000,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_2156e23a",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_missing_delivery_002",
+      "category": "missing_delivery",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 73600,
+      "actual_final_amount": 73600,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_9442f0e4",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_missing_delivery_003",
+      "category": "missing_delivery",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 36800,
+      "actual_final_amount": 36800,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_504a3a76",
+      "human_review_required": false
+    },
+    {
+      "case_id": "bench_missing_delivery_004",
+      "category": "missing_delivery",
+      "expected_classification": "exception",
+      "actual_classification": "clear",
+      "expected_final_amount": 92000,
+      "actual_final_amount": 92000,
+      "exception_reason": "Classification mismatch: expected exception, got clear",
+      "decision_id": "dec_7b0b405a",
+      "human_review_required": false
+    }
+  ]
+}
