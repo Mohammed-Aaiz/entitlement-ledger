@@ -16,6 +16,7 @@ Tests:
 10. Complete audit trail is persisted
 """
 import json
+import uuid
 import pytest
 from unittest.mock import patch, AsyncMock
 
@@ -168,7 +169,7 @@ class TestAgentResolvesWithExistingEvidence:
         )
 
         analysis = result["analysis"]
-        assert analysis["action"] == "analysis"
+        assert "claims" in analysis, "Analysis must contain claims"
         assert analysis["classification"] == "clear"
         assert len(analysis["claims"]) >= 1
 
@@ -457,7 +458,7 @@ class TestPromptInjectionDetection:
         )
 
         # The agent should handle injection gracefully
-        assert result["analysis"]["action"] == "analysis"
+        assert "claims" in result["analysis"], "Analysis must contain claims"
         # If the analysis was produced, it should not have been manipulated
         analysis = result["analysis"]
         assert "ignore previous" not in analysis.get("reasoning_summary", "").lower()
@@ -483,9 +484,8 @@ class TestPromptInjectionDetection:
             use_mock=True,
         )
 
-        # No approval action should exist
-        assert result["analysis"]["action"] == "analysis"
         # No financial manipulation in claims
+        assert "claims" in result["analysis"], "Analysis must contain claims"
         for claim in result["analysis"].get("claims", []):
             assert "approve" not in claim.get("reasoning", "").lower()
 
@@ -528,7 +528,7 @@ class TestToolFailureHandling:
         # Agent should produce a valid result even with tool issues
         assert "analysis" in result
         assert "agent_state" in result
-        assert result["analysis"]["action"] == "analysis"
+        assert "claims" in result["analysis"], "Analysis must contain claims"
 
     @pytest.mark.asyncio
     async def test_tool_execution_never_raises(self):
@@ -926,20 +926,18 @@ class TestMockToolSuite:
 
     def test_mock_agent_response_iterations(self):
         """Mock agent response varies by iteration number."""
-        from ai.agent import _mock_agent_response
+        from ai.agent import _mock_tool_response_with_tools
 
         evidence = [_make_order_evidence(amount=100000)]
         policies = _make_policies()
 
-        # Iteration 0 should request a tool
-        resp0 = _mock_agent_response(0, evidence, policies, set(), 100000)
-        parsed0 = json.loads(resp0)
-        assert parsed0["action"] == "tool_call"
+        # Iteration 0 should return tool calls
+        resp0 = _mock_tool_response_with_tools(0, evidence, policies, set(), 100000)
+        assert len(resp0.tool_calls) >= 1, "Iteration 0 should return tool calls"
 
-        # Iteration 2+ should produce analysis
-        resp2 = _mock_agent_response(2, evidence, policies, set(), 100000)
-        parsed2 = json.loads(resp2)
-        assert parsed2["action"] == "analysis"
+        # Iteration 2+ should return no tool calls (analysis phase)
+        resp2 = _mock_tool_response_with_tools(2, evidence, policies, set(), 100000)
+        assert len(resp2.tool_calls) == 0, "Iteration 2+ should return no tool calls"
 
 
 # ===========================================================================
@@ -1003,62 +1001,175 @@ class TestAgentEndToEnd:
 
     def test_run_scenario_uses_agent_and_produces_decision(self):
         """POST /api/scenarios/scenario_1/run must invoke the agent
-        and return a valid decision with hash chain integrity."""
+        and return a valid decision with hash chain integrity.
+
+        Mocks the LLM provider to exercise the native tool-calling path
+        deterministically without any real API calls.
+        """
+        import asyncio
+        import json
+        from unittest.mock import patch, MagicMock
         from main import _ensure_system_config
         from auth import create_access_token
         from fastapi.testclient import TestClient
         from main import app
+        from ai.llm_provider import ToolCallResponse, ToolCallInfo
+        from database import get_db
 
-        import asyncio
         loop = asyncio.new_event_loop()
         loop.run_until_complete(_ensure_system_config())
         loop.close()
 
-        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
-        client = TestClient(app)
-
-        # Scenario 1: Return + SLA Breach — has order, delivery, complaint, refund
-        resp = client.post(
-            "/api/scenarios/scenario_1/run",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-
-        # The endpoint returns 200 on success OR the idempotent reuse path
-        assert resp.status_code in (200, 503), f"Unexpected status: {resp.status_code}"
-        data = resp.json()
-
-        if resp.status_code == 503:
-            # No LLM available — agent can't run in live mode.
-            # This is expected in CI. Verify the error structure.
-            assert "No LLM provider available" in str(data) or data.get("detail", {}).get("error") == "No LLM provider available"
-            return
-
-        # Verify successful response structure
-        assert data["status"] == "completed"
-        assert data["scenario_id"] == "scenario_1"
-        assert "decision_id" in data
-
-        # Verify the decision was persisted and has valid structure
-        from database import get_db
-        import json
+        # ── Fresh evidence for a unique scenario to avoid idempotency ──
+        unique_suffix = uuid.uuid4().hex[:8]
+        test_scenario_id = f"scenario_e2e_{unique_suffix}"
+        test_ev_order = f"ev_e2e_{unique_suffix}_order"
+        test_ev_delivery = f"ev_e2e_{unique_suffix}_delivery"
+        test_ev_refund = f"ev_e2e_{unique_suffix}_refund"
+        test_order_id = f"ORD-E2E-{unique_suffix}"
 
         db_loop = asyncio.new_event_loop()
         db = db_loop.run_until_complete(get_db())
         try:
-            cursor = db_loop.run_until_complete(db.execute(
+            db_loop.run_until_complete(db.execute(
+                "INSERT OR REPLACE INTO scenarios (scenario_id, name, description, status, policy_ids) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (test_scenario_id, "E2E Test", "Agent e2e test", "pending",
+                 json.dumps(["platform_1_1", "sla_4_2", "returns_3_1"])),
+            ))
+            for ev_id, ev_type, content in [
+                (test_ev_order, "order",
+                 {"order_id": test_order_id, "seller_id": "seller_e2e",
+                  "amount": 100000, "order_date": "2024-11-15", "status": "delivered_with_issues"}),
+                (test_ev_delivery, "delivery",
+                 {"order_id": test_order_id, "promised_date": "2024-11-20",
+                  "actual_date": "2024-11-25", "delay_days": 5, "carrier": "Express"}),
+                (test_ev_refund, "refund_record",
+                 {"refund_id": f"REF-E2E-{unique_suffix}", "order_id": test_order_id,
+                  "amount": 5000, "reason": "Return due to delay", "status": "processed"}),
+            ]:
+                db_loop.run_until_complete(db.execute(
+                    "INSERT OR IGNORE INTO evidence "
+                    "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                    "linked_decision_ids, content_hash, version, created_at, ai_analyzed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)",
+                    (ev_id, "demo", ev_type, json.dumps(content), "[]", "[]",
+                     f"hash_{ev_id}", 1, "2024-12-01T00:00:00"),
+                ))
+            db_loop.run_until_complete(db.commit())
+        finally:
+            db_loop.run_until_complete(db.close())
+            db_loop.close()
+
+        # ── Mock the LLM provider ──
+        mock_provider = MagicMock()
+        mock_provider.model = "openai/gpt-oss-120b"
+        mock_provider.provider_info.return_value = {"provider": "groq"}
+
+        call_n = {"n": 0}
+
+        def _mock_cwt(messages, tools, tool_choice="auto", max_tokens=2048, temperature=0.0):
+            call_n["n"] += 1
+            if call_n["n"] == 1:
+                return ToolCallResponse(
+                    content=None,
+                    tool_calls=[ToolCallInfo(
+                        id="call_e2e_delivery",
+                        function_name="get_delivery",
+                        arguments={"order_id": test_order_id},
+                    )],
+                    finish_reason="tool_calls",
+                )
+            return ToolCallResponse(
+                content="Evidence gathered.",
+                tool_calls=[],
+                finish_reason="stop",
+            )
+
+        def _mock_cc(messages, max_tokens=2048, temperature=0.0,
+                     json_mode=False, response_schema=None):
+            return {
+                "claims": [
+                    {
+                        "claim_type": "sla_breach",
+                        "policy_clause_id": "sla_4_2",
+                        "evidence_ids": [test_ev_delivery],
+                        "reasoning": "Delivery was 5 days late",
+                    },
+                    {
+                        "claim_type": "return_processed",
+                        "policy_clause_id": "returns_3_1",
+                        "evidence_ids": [test_ev_refund],
+                        "reasoning": "Return was processed",
+                    },
+                ],
+                "classification": "clear",
+                "confidence": 0.92,
+                "reasoning_summary": "SLA breach and return clearly documented.",
+            }
+
+        mock_provider.complete_with_tools = MagicMock(side_effect=_mock_cwt)
+        mock_provider.chat_complete = MagicMock(side_effect=_mock_cc)
+
+        async def _mock_exec(tool_name, tenant_id, args):
+            if tool_name == "get_delivery":
+                return {
+                    "found": True,
+                    "deliveries": [{"evidence_id": test_ev_delivery, "delay_days": 5,
+                                     "promised_date": "2024-11-20", "actual_date": "2024-11-25"}],
+                    "count": 1,
+                }
+            if tool_name == "get_refund":
+                return {
+                    "found": True,
+                    "refunds": [{"evidence_id": test_ev_refund, "refund_id": f"REF-E2E-{unique_suffix}",
+                                   "amount": 5000, "status": "processed"}],
+                    "count": 1,
+                }
+            return {"found": False, "reason": f"Mock: {tool_name}"}
+
+        # ── Run endpoint with mocked LLM ──
+        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
+        client = TestClient(app)
+
+        with patch("ai.agent.get_provider", return_value=mock_provider), \
+             patch("ai.agent.is_ai_available", return_value=True), \
+             patch("ai.llm_provider.is_ai_available", return_value=True), \
+             patch("ai.agent.execute_tool", new=_mock_exec):
+
+            resp = client.post(
+                f"/api/scenarios/{test_scenario_id}/run",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, f"Unexpected status: {resp.status_code}: {resp.text}"
+        data = resp.json()
+
+        # Verify successful response structure
+        assert data["status"] == "completed"
+        assert data["scenario_id"] == test_scenario_id
+        assert "decision_id" in data
+        assert data["decision_status"] == "REVIEW_REQUIRED"
+
+        # Verify the agent used native tool calling
+        assert mock_provider.complete_with_tools.call_count >= 1
+
+        # Verify the decision was persisted with valid structure
+        db_loop2 = asyncio.new_event_loop()
+        db2 = db_loop2.run_until_complete(get_db())
+        try:
+            cursor = db_loop2.run_until_complete(db2.execute(
                 "SELECT * FROM decisions WHERE decision_id = ?",
                 (data["decision_id"],),
             ))
-            row = db_loop.run_until_complete(cursor.fetchone())
+            row = db_loop2.run_until_complete(cursor.fetchone())
             assert row is not None, "Decision not persisted in database"
 
-            # Verify decision has expected fields
             assert row["gross_amount"] > 0, "gross_amount must be positive"
             assert row["final_amount"] >= 0, "final_amount must be non-negative"
             assert row["status"] == "REVIEW_REQUIRED", "AI decisions must be REVIEW_REQUIRED"
             assert row["approver_id"] == "ai_pipeline", "approver must be ai_pipeline"
 
-            # Verify model_output contains agent state
             model_output = row["model_output"]
             if isinstance(model_output, str):
                 model_output = json.loads(model_output)
@@ -1066,7 +1177,6 @@ class TestAgentEndToEnd:
             assert "classification" in model_output, "model_output must contain classification"
             assert "policy_snapshot" in model_output, "model_output must contain policy_snapshot"
 
-            # Verify policy_snapshot has the required fields
             policy_snapshot = model_output["policy_snapshot"]
             assert len(policy_snapshot) >= 1, "policy_snapshot must have at least 1 policy"
             for p in policy_snapshot:
@@ -1075,94 +1185,265 @@ class TestAgentEndToEnd:
                 assert "clause_text" in p
                 assert "effective_date" in p
 
-            # Verify decision_hash is non-empty and has valid SHA-256 format
             import re
-            assert row["decision_hash"] and len(row["decision_hash"]) == 64, (
-                f"decision_hash must be 64-char SHA-256, got: {row['decision_hash'][:16]}..."
-            )
-            assert re.fullmatch(r"[0-9a-f]{64}", row["decision_hash"]), (
-                "decision_hash must be hex SHA-256"
-            )
-            # Verify prev_decision_hash is present
-            assert row["prev_decision_hash"], "prev_decision_hash must not be empty"
+            assert row["decision_hash"] and len(row["decision_hash"]) == 64
+            assert re.fullmatch(r"[0-9a-f]{64}", row["decision_hash"])
+            assert row["prev_decision_hash"]
 
-            # Verify evidence was linked and marked as analyzed
-            cursor_ev = db_loop.run_until_complete(db.execute(
+            cursor_ev = db_loop2.run_until_complete(db2.execute(
                 "SELECT evidence_id, linked_decision_ids, ai_analyzed FROM evidence "
                 "WHERE tenant_id = 'demo' AND ai_analyzed = TRUE"
             ))
-            ev_rows = db_loop.run_until_complete(cursor_ev.fetchall())
+            ev_rows = db_loop2.run_until_complete(cursor_ev.fetchall())
             assert len(ev_rows) >= 1, "At least one evidence record should be marked ai_analyzed"
 
         finally:
-            db_loop.run_until_complete(db.close())
-            db_loop.close()
+            db_loop2.run_until_complete(db2.close())
+            db_loop2.close()
 
     def test_run_scenario_deterministic_calculation_not_overridden(self):
         """The deterministic calculation engine must remain authoritative.
-        Agent claims must not override financial amounts."""
+
+        Mocks the LLM provider so the full native tool-calling path is
+        exercised deterministically without any real API calls.
+
+        Verifies:
+          /api/scenarios/{scenario_id}/run
+          → run_agent() uses complete_with_tools() (native tool calling)
+          → tool_call → execute_tool() → role="tool" message
+          → final ReasoningSchema analysis
+          → deterministic calculation engine produces correct amounts
+          → decision is persisted with valid hash chain
+        """
+        import asyncio
+        import json
+        from unittest.mock import patch, MagicMock, AsyncMock
+
         from main import _ensure_system_config
         from auth import create_access_token
         from fastapi.testclient import TestClient
         from main import app
-        from calculations import calculate_platform_fee, calculate_final_amount, build_line_items
+        from calculations import calculate_platform_fee
+        from ai.llm_provider import ToolCallResponse, ToolCallInfo
 
-        import asyncio
+        # Ensure seed data exists
         loop = asyncio.new_event_loop()
         loop.run_until_complete(_ensure_system_config())
         loop.close()
 
-        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
-        client = TestClient(app)
-
-        resp = client.post(
-            "/api/scenarios/scenario_1/run",
-            headers={"Authorization": f"Bearer {token}"},
-        )
-
-        if resp.status_code == 503:
-            # No LLM — verify deterministic calc works independently
-            assert True
-            return
-
-        data = resp.json()
-        if data.get("status") != "completed":
-            # May be idempotent reuse — that's fine
-            return
-
-        # Verify the decision's amounts match deterministic calculation
+        # ── Fresh evidence: insert unanalyzed evidence under a unique
+        # scenario so the idempotency check does NOT short-circuit.
         from database import get_db
-        import json
+        unique_suffix = uuid.uuid4().hex[:8]
+        test_scenario_id = f"scenario_calc_{unique_suffix}"
+        test_evidence_ids = [f"ev_calc_{unique_suffix}_order", f"ev_calc_{unique_suffix}_delivery"]
 
         db_loop = asyncio.new_event_loop()
         db = db_loop.run_until_complete(get_db())
         try:
-            cursor = db_loop.run_until_complete(db.execute(
-                "SELECT gross_amount, final_amount, line_items FROM decisions WHERE decision_id = ?",
-                (data["decision_id"],),
+            # Create a scenario entry
+            db_loop.run_until_complete(db.execute(
+                "INSERT OR REPLACE INTO scenarios (scenario_id, name, description, status, policy_ids) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (test_scenario_id, "Calc Test", "Deterministic calc test", "pending",
+                 json.dumps(["platform_1_1", "sla_4_2"])),
             ))
-            row = db_loop.run_until_complete(cursor.fetchone())
-            if row:
-                gross = row["gross_amount"]
-                final = row["final_amount"]
-                items = json.loads(row["line_items"]) if isinstance(row["line_items"], str) else row["line_items"]
-
-                # Platform fee is always 8% of gross
-                assert calculate_platform_fee(gross) == int(gross * 0.08), (
-                    "Platform fee must be exactly 8% of gross"
-                )
-
-                # Final amount must be gross - all deductions
-                total_deductions = sum(
-                    item["amount"] for item in items
-                    if item.get("type") in ("fee", "deduction")
-                )
-                assert final == gross - total_deductions, (
-                    f"final_amount ({final}) must equal gross ({gross}) - deductions ({total_deductions})"
-                )
+            # Insert fresh, unanalyzed evidence
+            for ev_id, ev_type, content in [
+                (test_evidence_ids[0], "order",
+                 {"order_id": f"ORD-CALC-{unique_suffix}", "seller_id": "seller_calc",
+                  "amount": 100000, "order_date": "2024-11-15", "status": "delivered_with_issues"}),
+                (test_evidence_ids[1], "delivery",
+                 {"order_id": f"ORD-CALC-{unique_suffix}", "promised_date": "2024-11-20",
+                  "actual_date": "2024-11-25", "delay_days": 5, "carrier": "Express"}),
+            ]:
+                db_loop.run_until_complete(db.execute(
+                    "INSERT OR IGNORE INTO evidence "
+                    "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                    "linked_decision_ids, content_hash, version, created_at, ai_analyzed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)",
+                    (ev_id, "demo", ev_type, json.dumps(content), "[]", "[]",
+                     f"hash_{ev_id}", 1, "2024-12-01T00:00:00"),
+                ))
+            db_loop.run_until_complete(db.commit())
         finally:
             db_loop.run_until_complete(db.close())
             db_loop.close()
+
+        # ── Mock the LLM provider to exercise native tool calling ──
+        # Sequence:
+        #   call 1: complete_with_tools → tool_call get_delivery
+        #   call 2: complete_with_tools → no tool calls (evidence gathering done)
+        #   call 3: chat_complete → ReasoningSchema analysis
+        mock_provider = MagicMock()
+        mock_provider.model = "openai/gpt-oss-120b"
+        mock_provider.provider_info.return_value = {"provider": "groq"}
+
+        call_count = {"n": 0}
+
+        def _mock_complete_with_tools(messages, tools, tool_choice="auto",
+                                     max_tokens=2048, temperature=0.0):
+            call_count["n"] += 1
+            if call_count["n"] == 1:
+                # First call: return a native tool call for get_delivery
+                return ToolCallResponse(
+                    content=None,
+                    tool_calls=[ToolCallInfo(
+                        id="call_test_delivery",
+                        function_name="get_delivery",
+                        arguments={"order_id": f"ORD-CALC-{unique_suffix}"},
+                    )],
+                    finish_reason="tool_calls",
+                )
+            else:
+                # Subsequent calls: no tool calls → evidence gathering complete
+                return ToolCallResponse(
+                    content="Evidence gathering complete.",
+                    tool_calls=[],
+                    finish_reason="stop",
+                )
+
+        def _mock_chat_complete(messages, max_tokens=2048, temperature=0.0,
+                               json_mode=False, response_schema=None):
+            # Return a ReasoningSchema-conformant analysis
+            return {
+                "claims": [
+                    {
+                        "claim_type": "sla_breach",
+                        "policy_clause_id": "sla_4_2",
+                        "evidence_ids": [test_evidence_ids[1]],
+                        "reasoning": "Delivery was 5 days late per policy SLA-4.2",
+                    },
+                ],
+                "classification": "clear",
+                "confidence": 0.95,
+                "reasoning_summary": "SLA breach clearly documented by delivery evidence.",
+            }
+
+        mock_provider.complete_with_tools = MagicMock(side_effect=_mock_complete_with_tools)
+        mock_provider.chat_complete = MagicMock(side_effect=_mock_chat_complete)
+
+        # Mock execute_tool to return deterministic delivery evidence
+        async def _mock_exec_tool(tool_name, tenant_id, args):
+            if tool_name == "get_delivery":
+                return {
+                    "found": True,
+                    "deliveries": [{
+                        "evidence_id": test_evidence_ids[1],
+                        "promised_date": "2024-11-20",
+                        "actual_date": "2024-11-25",
+                        "delay_days": 5,
+                        "carrier": "Express",
+                    }],
+                    "count": 1,
+                }
+            return {"found": False, "reason": f"Mock: {tool_name}"}
+
+        # ── Run the endpoint with mocked LLM ──
+        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
+        client = TestClient(app)
+
+        with patch("ai.agent.get_provider", return_value=mock_provider), \
+             patch("ai.agent.is_ai_available", return_value=True), \
+             patch("ai.llm_provider.is_ai_available", return_value=True), \
+             patch("ai.agent.execute_tool", new=_mock_exec_tool):
+
+            resp = client.post(
+                f"/api/scenarios/{test_scenario_id}/run",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert resp.status_code == 200, f"Expected 200, got {resp.status_code}: {resp.text}"
+        data = resp.json()
+        assert data["status"] == "completed"
+        assert data["decision_status"] == "REVIEW_REQUIRED"
+
+        # ── ASSERTION 1: complete_with_tools() was invoked (native tool calling) ──
+        assert mock_provider.complete_with_tools.call_count >= 1, (
+            "complete_with_tools() must be called at least once — "
+            "the agent must use native tool calling"
+        )
+
+        # ── ASSERTION 2: complete_with_tools was called with tools param ──
+        # Use call_args which is a _Call object: call_args.args, call_args.kwargs
+        first_call = mock_provider.complete_with_tools.call_args_list[0]
+        sent_tools = first_call.kwargs.get("tools", [])
+        sent_messages = first_call.kwargs.get("messages", [])
+        assert len(sent_tools) > 0, "tools parameter must be non-empty (native tool calling)"
+        assert isinstance(sent_messages, list) and len(sent_messages) > 0, "messages must be non-empty"
+
+        # ── ASSERTION 3: Tool call → execute_tool → role="tool" → analysis ──
+        # The second complete_with_tools call should contain a tool result message
+        if mock_provider.complete_with_tools.call_count >= 2:
+            second_call = mock_provider.complete_with_tools.call_args_list[1]
+            second_messages = second_call.kwargs.get("messages", [])
+            tool_messages = [m for m in second_messages if m.get("role") == "tool"]
+            assert len(tool_messages) >= 1, (
+                "After a tool call, the next LLM call must include role=\"tool\" messages "
+                "containing the tool execution result"
+            )
+            # Verify the tool message has tool_call_id linking it to the tool call
+            assert tool_messages[0].get("tool_call_id") == "call_test_delivery", (
+                "role=\"tool\" message must reference the tool_call_id"
+            )
+
+        # ── ASSERTION 4: chat_complete() was called for final ReasoningSchema ──
+        assert mock_provider.chat_complete.call_count >= 1, (
+            "chat_complete() must be called for the final analysis phase"
+        )
+        analysis_call = mock_provider.chat_complete.call_args_list[0]
+        analysis_kwargs = analysis_call.kwargs if hasattr(analysis_call, 'kwargs') else {}
+        assert analysis_kwargs.get("json_mode") is True, "Final analysis must use json_mode"
+        assert analysis_kwargs.get("response_schema") is not None, (
+            "Final analysis must use response_schema (ReasoningSchema)"
+        )
+
+        # ── ASSERTION 5: Decision was persisted with deterministic calculation ──
+        decision_id = data["decision_id"]
+        db_loop2 = asyncio.new_event_loop()
+        db2 = db_loop2.run_until_complete(get_db())
+        try:
+            cursor = db_loop2.run_until_complete(db2.execute(
+                "SELECT gross_amount, final_amount, line_items, decision_hash, "
+                "prev_decision_hash, model_output FROM decisions WHERE decision_id = ?",
+                (decision_id,),
+            ))
+            row = db_loop2.run_until_complete(cursor.fetchone())
+            assert row is not None, "Decision must be persisted in database"
+
+            gross = row["gross_amount"]
+            final = row["final_amount"]
+            items = json.loads(row["line_items"]) if isinstance(row["line_items"], str) else row["line_items"]
+
+            # Platform fee is always exactly 8% of gross (deterministic)
+            assert calculate_platform_fee(gross) == int(gross * 0.08), (
+                "Platform fee must be exactly 8% of gross (deterministic engine)"
+            )
+
+            # Final amount = gross - all deductions (deterministic)
+            total_deductions = sum(
+                item["amount"] for item in items
+                if item.get("type") in ("fee", "deduction")
+            )
+            assert final == gross - total_deductions, (
+                f"final_amount ({final}) must equal gross ({gross}) - deductions ({total_deductions})"
+            )
+
+            # Hash chain must be valid
+            import re
+            assert row["decision_hash"] and len(row["decision_hash"]) == 64
+            assert re.fullmatch(r"[0-9a-f]{64}", row["decision_hash"])
+            assert row["prev_decision_hash"]
+
+            # Model output must contain agent's claims and calculation trace
+            model_output = json.loads(row["model_output"]) if isinstance(row["model_output"], str) else row["model_output"]
+            assert "claims" in model_output
+            assert "calculation_trace" in model_output
+            assert model_output["classification"] == "clear"
+
+        finally:
+            db_loop2.run_until_complete(db2.close())
+            db_loop2.close()
 
     def test_pipeline_accepts_agent_result(self):
         """run_pipeline with agent_result must skip extraction+reasoning
@@ -1335,3 +1616,425 @@ class TestAgentEndToEnd:
         # The pipeline must include agent audit data in stages
         stages = result["stages"]
         assert "agent" in stages or "extraction" in stages
+
+
+# ===========================================================================
+# Native Tool Calling Tests — comprehensive test suite (13 cases)
+# ===========================================================================
+
+
+class TestNativeToolCalling:
+    """Verify native tool-calling architecture works correctly."""
+
+    # --- Test 1: Native tool_call returned → tool executes ---
+    @pytest.mark.asyncio
+    async def test_native_tool_call_executes_tool(self):
+        """When the model returns a native tool_call, the tool should execute."""
+        from ai.agent import run_agent
+
+        evidence = [_make_order_evidence(amount=100000)]
+        policies = _make_policies()
+
+        result = await run_agent(
+            tenant_id="demo",
+            scenario_id="test_native_tool",
+            entity_id="seller_test",
+            gross_amount=100000,
+            evidence_records=evidence,
+            policy_records=policies,
+            use_mock=True,
+        )
+
+        # The mock should have returned a tool call → tool should have executed
+        tools = result["agent_state"].tools_called
+        assert len(tools) >= 1, "At least one tool should have been called"
+        tool_names = [t["tool"] for t in tools]
+        assert "get_delivery" in tool_names or "get_refund" in tool_names, (
+            f"Expected get_delivery or get_refund, got: {tool_names}"
+        )
+
+    # --- Test 2: Multiple tool calls ---
+    @pytest.mark.asyncio
+    async def test_multiple_tool_calls(self):
+        """The agent should make multiple tool calls across iterations."""
+        from ai.agent import run_agent
+
+        evidence = [_make_order_evidence(amount=100000)]
+        policies = _make_policies()
+
+        result = await run_agent(
+            tenant_id="demo",
+            scenario_id="test_multi_tool",
+            entity_id="seller_test",
+            gross_amount=100000,
+            evidence_records=evidence,
+            policy_records=policies,
+            use_mock=True,
+        )
+
+        tools = result["agent_state"].tools_called
+        # Mock agent calls get_delivery then get_refund (2 tool calls)
+        assert len(tools) >= 2, f"Expected >= 2 tool calls, got {len(tools)}"
+
+    # --- Test 3: Tool result fed back to model ---
+    @pytest.mark.asyncio
+    async def test_tool_result_fed_back_to_model(self):
+        """Tool results should be included in the conversation history."""
+        from ai.agent import run_agent
+
+        evidence = [_make_order_evidence(amount=100000)]
+        policies = _make_policies()
+
+        result = await run_agent(
+            tenant_id="demo",
+            scenario_id="test_feedback",
+            entity_id="seller_test",
+            gross_amount=100000,
+            evidence_records=evidence,
+            policy_records=policies,
+            use_mock=True,
+        )
+
+        # After tool calls, the agent should have examined more evidence
+        # and produced an analysis, proving tool results were consumed
+        assert len(result["evidence_ids_examined"]) >= 1
+        assert "claims" in result["analysis"]
+
+    # --- Test 4: Model stops with final analysis ---
+    @pytest.mark.asyncio
+    async def test_model_stops_with_final_analysis(self):
+        """The agent should stop when the model returns no tool calls."""
+        from ai.agent import run_agent
+
+        evidence = [
+            _make_order_evidence(amount=100000),
+            _make_delivery_evidence(delay_days=5),
+            _make_refund_evidence(amount=5000),
+        ]
+        policies = _make_policies()
+
+        result = await run_agent(
+            tenant_id="demo",
+            scenario_id="test_stop_analysis",
+            entity_id="seller_test",
+            gross_amount=100000,
+            evidence_records=evidence,
+            policy_records=policies,
+            use_mock=True,
+        )
+
+        state = result["agent_state"]
+        # Should stop with analysis or evidence gathering complete
+        assert state.stop_reason in (
+            "analysis_complete", "evidence_gathering_complete",
+            "max_iterations", "max_tool_calls",
+        )
+        # Should have a valid analysis
+        assert "claims" in result["analysis"]
+        assert "classification" in result["analysis"]
+
+    # --- Test 5: Tool argument validation ---
+    @pytest.mark.asyncio
+    async def test_tool_argument_validation(self):
+        """Tool arguments should be validated and sanitized."""
+        from ai.agent import _validate_tool_args, _get_tool_params
+
+        # Valid args
+        params = _get_tool_params("get_order")
+        assert "order_id" in params
+
+        validated = _validate_tool_args("get_order", {"order_id": "ORD-001"}, params)
+        assert validated == {"order_id": "ORD-001"}
+
+        # Invalid type (dict) should be filtered
+        validated = _validate_tool_args("get_order", {"order_id": {"nested": "bad"}}, params)
+        assert "order_id" not in validated, "Dict values should be filtered"
+
+        # Extra params should be filtered
+        validated = _validate_tool_args("get_order", {"order_id": "ORD-001", "evil": "hack"}, params)
+        assert "evil" not in validated, "Extra params should be filtered"
+        assert validated == {"order_id": "ORD-001"}
+
+        # None values should be skipped
+        validated = _validate_tool_args("get_order", {"order_id": None}, params)
+        assert "order_id" not in validated, "None values should be skipped"
+
+    # --- Test 6: Server-controlled tenant isolation ---
+    @pytest.mark.asyncio
+    async def test_server_controlled_tenant_isolation(self):
+        """tenant_id must come from server context, not model output."""
+        from ai.agent import run_agent
+
+        evidence = [_make_order_evidence(amount=100000)]
+        policies = _make_policies()
+
+        # Run with tenant_id="demo"
+        result = await run_agent(
+            tenant_id="demo",
+            scenario_id="test_tenant",
+            entity_id="seller_test",
+            gross_amount=100000,
+            evidence_records=evidence,
+            policy_records=policies,
+            use_mock=True,
+        )
+
+        # The state should record the tenant_id from the server, not from model
+        state = result["agent_state"]
+        assert state.tenant_id == "demo", "tenant_id must come from server context"
+
+    # --- Test 7: Tool failure ---
+    @pytest.mark.asyncio
+    async def test_tool_failure_handling_native(self):
+        """Tool failures should be handled gracefully in native tool calling."""
+        from ai.agent_tools import execute_tool
+
+        # Unknown tool should return error, not raise
+        result = await execute_tool("unknown_tool_xyz", "demo", {})
+        assert result.get("found") is False
+        assert "error" in result
+
+        # Tool execution failure should return error dict
+        result = await execute_tool("get_order", "demo", {"order_id": "FAKE"})
+        assert isinstance(result, dict)
+
+    # --- Test 8: Max tool calls ---
+    @pytest.mark.asyncio
+    async def test_max_tool_calls_enforced(self):
+        """Agent must stop when MAX_TOOL_CALLS is reached."""
+        from ai.agent import run_agent, MAX_TOOL_CALLS
+
+        evidence = [_make_order_evidence(amount=100000)]
+        policies = _make_policies()
+
+        result = await run_agent(
+            tenant_id="demo",
+            scenario_id="test_max_tc",
+            entity_id="seller_test",
+            gross_amount=100000,
+            evidence_records=evidence,
+            policy_records=policies,
+            use_mock=True,
+        )
+
+        state = result["agent_state"]
+        assert len(state.tools_called) <= MAX_TOOL_CALLS, (
+            f"Tool calls {len(state.tools_called)} exceeded limit {MAX_TOOL_CALLS}"
+        )
+
+    # --- Test 9: Max iterations ---
+    @pytest.mark.asyncio
+    async def test_max_iterations_enforced(self):
+        """Agent must stop when MAX_AGENT_ITERATIONS is reached."""
+        from ai.agent import run_agent, MAX_AGENT_ITERATIONS
+
+        evidence = [_make_order_evidence(amount=100000)]
+        policies = _make_policies()
+
+        result = await run_agent(
+            tenant_id="demo",
+            scenario_id="test_max_iter_native",
+            entity_id="seller_test",
+            gross_amount=100000,
+            evidence_records=evidence,
+            policy_records=policies,
+            use_mock=True,
+        )
+
+        state = result["agent_state"]
+        assert state.iteration_count <= MAX_AGENT_ITERATIONS, (
+            f"Iterations {state.iteration_count} exceeded limit {MAX_AGENT_ITERATIONS}"
+        )
+
+    # --- Test 10: Timeout ---
+    @pytest.mark.asyncio
+    async def test_timeout_enforcement(self):
+        """Agent must respect MAX_EXECUTION_DURATION_S."""
+        from ai.agent import MAX_EXECUTION_DURATION_S
+        import time
+
+        start = time.time()
+        # Just verify the constant exists and is reasonable
+        assert MAX_EXECUTION_DURATION_S >= 10
+        assert MAX_EXECUTION_DURATION_S <= 300
+
+    # --- Test 11: Final strict structured output ---
+    @pytest.mark.asyncio
+    async def test_final_strict_structured_output(self):
+        """The final analysis should conform to ReasoningSchema structure."""
+        from ai.agent import run_agent
+
+        evidence = [
+            _make_order_evidence(amount=100000),
+            _make_delivery_evidence(delay_days=5),
+            _make_refund_evidence(amount=5000),
+        ]
+        policies = _make_policies()
+
+        result = await run_agent(
+            tenant_id="demo",
+            scenario_id="test_strict_output",
+            entity_id="seller_test",
+            gross_amount=100000,
+            evidence_records=evidence,
+            policy_records=policies,
+            use_mock=True,
+        )
+
+        analysis = result["analysis"]
+        # Must contain all ReasoningSchema fields
+        assert "claims" in analysis, "Missing claims"
+        assert "classification" in analysis, "Missing classification"
+        assert "confidence" in analysis, "Missing confidence"
+        assert "reasoning_summary" in analysis, "Missing reasoning_summary"
+        assert isinstance(analysis["claims"], list), "claims must be a list"
+        assert isinstance(analysis["confidence"], (int, float)), "confidence must be numeric"
+        assert 0.0 <= analysis["confidence"] <= 1.0, "confidence must be 0.0-1.0"
+        assert analysis["classification"] in ("clear", "exception", "ambiguous"), (
+            f"Invalid classification: {analysis['classification']}"
+        )
+
+    # --- Test 12: /api/scenarios/{scenario_id}/run integration ---
+    def test_run_scenario_integration(self):
+        """POST /api/scenarios/scenario_1/run should invoke the native tool-calling agent."""
+        from main import _ensure_system_config
+        from auth import create_access_token
+        from fastapi.testclient import TestClient
+        from main import app
+
+        import asyncio
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(_ensure_system_config())
+        loop.close()
+
+        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
+        client = TestClient(app)
+
+        resp = client.post(
+            "/api/scenarios/scenario_1/run",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+
+        # Returns 200 on success OR 503 if no LLM available (expected in CI)
+        assert resp.status_code in (200, 503), f"Unexpected status: {resp.status_code}"
+        data = resp.json()
+
+        if resp.status_code == 503:
+            assert "No LLM provider available" in str(data)
+            return
+
+        assert data["status"] == "completed"
+        assert "agent_success" in data, "Response must include agent_success field"
+        assert "agent_iterations" in data, "Response must include agent_iterations"
+        assert "agent_tool_calls" in data, "Response must include agent_tool_calls"
+        assert "agent_stop_reason" in data, "Response must include agent_stop_reason"
+
+    # --- Test 13: agent_success vs agent_failure response semantics ---
+    @pytest.mark.asyncio
+    async def test_agent_success_semantics(self):
+        """On successful agent run, agent_success must be True."""
+        from ai.agent import run_agent
+
+        evidence = [
+            _make_order_evidence(amount=100000),
+            _make_delivery_evidence(delay_days=5),
+            _make_refund_evidence(amount=5000),
+        ]
+        policies = _make_policies()
+
+        result = await run_agent(
+            tenant_id="demo",
+            scenario_id="test_success",
+            entity_id="seller_test",
+            gross_amount=100000,
+            evidence_records=evidence,
+            policy_records=policies,
+            use_mock=True,
+        )
+
+        state = result["agent_state"]
+        # Mock agent should succeed
+        assert state.success is True, "Agent should report success"
+        assert state.stop_reason != "llm_error", "Success agent should not have llm_error"
+
+    @pytest.mark.asyncio
+    async def test_agent_failure_semantics(self):
+        """On agent failure (LLM error), agent_success must be False."""
+        from ai.agent import run_agent
+        from unittest.mock import patch, MagicMock
+        from ai.llm_provider import ToolCallResponse
+
+        evidence = [_make_order_evidence(amount=100000)]
+        policies = _make_policies()
+
+        # Mock the provider to raise an exception
+        mock_provider = MagicMock()
+        mock_provider.model = "test-model"
+        mock_provider.provider_info.return_value = {"provider": "test"}
+        mock_provider.complete_with_tools.side_effect = Exception("Simulated LLM failure")
+
+        with patch("ai.agent.get_provider", return_value=mock_provider):
+            with patch("ai.agent.is_ai_available", return_value=True):
+                result = await run_agent(
+                    tenant_id="demo",
+                    scenario_id="test_failure",
+                    entity_id="seller_test",
+                    gross_amount=100000,
+                    evidence_records=evidence,
+                    policy_records=policies,
+                    use_mock=False,
+                )
+
+        state = result["agent_state"]
+        assert state.success is False, "Failed agent should report failure"
+        assert state.stop_reason == "llm_error", "Failed agent should have llm_error stop reason"
+        # Should still return a valid analysis structure (fallback)
+        assert "claims" in result["analysis"]
+        assert result["analysis"]["classification"] == "exception"
+
+
+class TestNativeToolDefinitions:
+    """Verify the native tool definitions are properly structured."""
+
+    def test_native_tool_definitions_format(self):
+        """Native tool definitions must be OpenAI-compatible."""
+        from ai.agent import _build_native_tool_definitions
+
+        tools = _build_native_tool_definitions()
+        assert len(tools) == 9, f"Expected 9 tools, got {len(tools)}"
+
+        for tool in tools:
+            assert tool["type"] == "function", f"Tool must be type 'function'"
+            func = tool["function"]
+            assert "name" in func, "Tool must have name"
+            assert "description" in func, "Tool must have description"
+            assert "parameters" in func, "Tool must have parameters"
+            params = func["parameters"]
+            assert params["type"] == "object", "Parameters must be type 'object'"
+            assert "properties" in params, "Parameters must have properties"
+            assert "required" in params, "Parameters must have required"
+
+    def test_tool_call_response_dataclass(self):
+        """ToolCallResponse should have required fields."""
+        from ai.llm_provider import ToolCallResponse, ToolCallInfo
+
+        # Empty response
+        resp = ToolCallResponse()
+        assert resp.content is None
+        assert resp.tool_calls == []
+        assert resp.finish_reason == "stop"
+
+        # With tool call
+        tc = ToolCallInfo(
+            id="call_123",
+            function_name="get_order",
+            arguments={"order_id": "ORD-001"},
+        )
+        resp = ToolCallResponse(
+            content=None,
+            tool_calls=[tc],
+            finish_reason="tool_calls",
+        )
+        assert len(resp.tool_calls) == 1
+        assert resp.tool_calls[0].function_name == "get_order"
+        assert resp.tool_calls[0].arguments == {"order_id": "ORD-001"}

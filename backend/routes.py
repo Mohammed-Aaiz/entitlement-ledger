@@ -490,15 +490,32 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
             await log_audit(user.tenant_id, "scenario.run", "scenario", scenario_id,
                             user_id=user.user_id, details={"decision_id": decision["decision_id"]})
 
-            return {
+            # Determine agent success/failure semantics
+            agent_success = agent_result.get("agent_state")
+            agent_success = getattr(agent_result.get("agent_state"), "success", True) if agent_result.get("agent_state") else True
+
+            response = {
                 "status": "completed",
                 "scenario_id": scenario_id,
                 "decision_id": decision["decision_id"],
                 "decision_status": decision["status"],
-                "message": "AI pipeline executed successfully.",
                 "stages": result["stages"],
                 "total_duration_ms": result["total_duration_ms"],
+                "agent_success": agent_success,
+                "agent_iterations": getattr(agent_result.get("agent_state"), "iteration_count", 0),
+                "agent_tool_calls": agent_result.get("tool_calls", 0),
+                "agent_stop_reason": getattr(agent_result.get("agent_state"), "stop_reason", "unknown"),
             }
+
+            if agent_success:
+                response["message"] = "AI pipeline executed successfully."
+            else:
+                response["message"] = (
+                    f"Agent execution failed (stop_reason={response['agent_stop_reason']}). "
+                    f"Decision created but may require manual review."
+                )
+
+            return response
         except Exception as e:
             logger.error("Pipeline execution failed for %s: %s", scenario_id, str(e))
             raise HTTPException(

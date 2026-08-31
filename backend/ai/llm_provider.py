@@ -22,9 +22,35 @@ from typing import Optional
 
 import httpx  # noqa: E402
 
+from dataclasses import dataclass, field
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Native tool-calling types
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ToolCallInfo:
+    """A single tool call returned by the LLM."""
+    id: str
+    function_name: str
+    arguments: dict
+
+
+@dataclass
+class ToolCallResponse:
+    """Response from complete_with_tools().
+
+    When the model returns tool calls, *tool_calls* is non-empty and
+    *content* may be None.  When the model produces a final text answer
+    (no tool calls), *tool_calls* is empty and *content* holds the text.
+    """
+    content: str | None = None
+    tool_calls: list[ToolCallInfo] = field(default_factory=list)
+    finish_reason: str = "stop"
 
 
 # ---------------------------------------------------------------------------
@@ -100,6 +126,41 @@ class LLMProvider(ABC):
         """Return metadata about this provider for the UI."""
         ...
 
+    def complete_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str = "auto",
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+    ) -> ToolCallResponse:
+        """Complete with native tool/function calling support.
+
+        Providers that support OpenAI-compatible tool calling (e.g. Groq)
+        override this.  The default implementation returns text-only
+        (no tool calls) so the agent loop can fall back to single-turn.
+
+        *messages*: conversation history (role/content/tool_calls/tool_call_id)
+        *tools*: list of OpenAI-compatible tool definitions
+        *tool_choice*: "auto", "none", or {"type": "function", "function": {"name": ...}}
+        """
+        # Default: use complete() with a flattened prompt — no tool calling
+        prompt = "\n".join(
+            f"[{m['role'].upper()}] {m.get('content', '')}"
+            for m in messages if m.get('content')
+        )
+        content = self.complete(
+            prompt,
+            system="",
+            max_tokens=max_tokens,
+            temperature=temperature,
+        )
+        return ToolCallResponse(
+            content=content,
+            tool_calls=[],
+            finish_reason="stop",
+        )
+
     def complete_json(
         self,
         prompt: str,
@@ -130,6 +191,40 @@ class LLMProvider(ABC):
         if hasattr(result, "model_dump"):
             return result.model_dump()
         return _parse_json_response(result)
+
+    def chat_complete(
+        self,
+        messages: list[dict],
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        json_mode: bool = False,
+        response_schema=None,
+    ):
+        """Send a multi-turn message list and return the response.
+
+        Unlike ``complete()`` which takes a single prompt string, this
+        accepts the full conversation history.  Providers that support
+        multi-turn chat (Groq, Gemini, OpenRouter, etc.) override this.
+        The default flattens the conversation into a single prompt.
+        """
+        system = ""
+        prompt_parts: list[str] = []
+        for m in messages:
+            if m["role"] == "system":
+                system = m.get("content", "")
+            elif m["role"] == "user":
+                prompt_parts.append(m.get("content", ""))
+            elif m["role"] == "assistant":
+                prompt_parts.append(m.get("content", ""))
+        prompt = "\n".join(prompt_parts)
+        return self.complete(
+            prompt,
+            system=system,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            json_mode=json_mode,
+            response_schema=response_schema,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -577,6 +672,175 @@ class GroqProvider(LLMProvider):
             "description": f"Groq ({self.model})",
         }
 
+    def _groq_request(self, payload: dict, timeout: float = 60.0) -> dict:
+        """Send a request to the Groq API and return parsed JSON."""
+        if not self.api_key:
+            raise EnvironmentError("GROQ_API_KEY is not set")
+
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/chat/completions",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {self.api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=timeout,
+            )
+        except httpx.TimeoutException:
+            raise ValueError(f"Groq request timed out after {timeout}s")
+        except httpx.RequestError as e:
+            raise ValueError(f"Groq connection error: {e}")
+
+        if resp.status_code != 200:
+            error_body = resp.text[:500]
+            raise ValueError(
+                f"Groq API error {resp.status_code}: {error_body}"
+            )
+
+        return resp.json()
+
+    def chat_complete(
+        self,
+        messages: list[dict],
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+        json_mode: bool = False,
+        response_schema=None,
+    ):
+        """Send a multi-turn message list to Groq."""
+        payload: dict = {
+            "model": self.model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        if response_schema is not None and json_mode:
+            strict_schema = _pydantic_to_strict_json_schema(response_schema)
+            schema_name = getattr(response_schema, "__name__", "response")
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": strict_schema,
+                },
+            }
+        elif json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        t0 = time.time()
+        data = self._groq_request(payload)
+        elapsed = time.time() - t0
+
+        choices = data.get("choices", [])
+        if not choices:
+            raise ValueError("Groq returned no choices")
+
+        message = choices[0].get("message", {})
+        content = message.get("content") or ""
+        finish_reason = choices[0].get("finish_reason")
+
+        if not content and finish_reason != "length":
+            raise ValueError(
+                f"Groq returned empty content. finish_reason={finish_reason}"
+            )
+
+        logger.info(
+            "Groq chat response: %d chars, finish_reason=%s, elapsed=%.2fs",
+            len(content), finish_reason, elapsed,
+        )
+
+        if response_schema is not None and json_mode:
+            try:
+                return json.loads(content)
+            except json.JSONDecodeError:
+                logger.warning("Groq structured output not valid JSON")
+
+        return content
+
+    def complete_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        tool_choice: str = "auto",
+        max_tokens: int = 2048,
+        temperature: float = 0.0,
+    ) -> ToolCallResponse:
+        """Complete with native tool/function calling via the Groq API.
+
+        Sends the full conversation history plus tool definitions.
+        Inspects ``response.choices[0].message.tool_calls`` for
+        native tool calls, or returns text content if the model
+        chose to respond without calling tools.
+        """
+        payload: dict = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": tool_choice,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+
+        logger.info(
+            "Groq tool-calling request: model=%s, messages=%d, tools=%d",
+            self.model, len(messages), len(tools),
+        )
+        t0 = time.time()
+
+        try:
+            data = self._groq_request(payload, timeout=90.0)
+        except Exception as e:
+            logger.error("Groq tool-calling request failed: %s", str(e))
+            raise
+
+        elapsed = time.time() - t0
+
+        choices = data.get("choices", [])
+        if not choices:
+            raise ValueError("Groq returned no choices")
+
+        choice = choices[0]
+        message = choice.get("message", {})
+        content = message.get("content")  # may be None when tool calls present
+        finish_reason = choice.get("finish_reason", "stop")
+
+        # Parse native tool calls
+        raw_tool_calls = message.get("tool_calls", []) or []
+        parsed_tool_calls: list[ToolCallInfo] = []
+        for tc in raw_tool_calls:
+            func = tc.get("function", {})
+            func_name = func.get("name", "")
+            args_raw = func.get("arguments", "{}")
+            # Parse arguments from JSON string
+            try:
+                args_dict = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+            except json.JSONDecodeError:
+                args_dict = {}
+            parsed_tool_calls.append(
+                ToolCallInfo(
+                    id=tc.get("id", ""),
+                    function_name=func_name,
+                    arguments=args_dict,
+                )
+            )
+
+        logger.info(
+            "Groq tool-calling response: content=%s, tool_calls=%d, finish_reason=%s, elapsed=%.2fs",
+            "present" if content else "None",
+            len(parsed_tool_calls),
+            finish_reason,
+            elapsed,
+        )
+
+        return ToolCallResponse(
+            content=content,
+            tool_calls=parsed_tool_calls,
+            finish_reason=finish_reason,
+        )
+
     def complete(
         self,
         prompt: str,
@@ -623,30 +887,9 @@ class GroqProvider(LLMProvider):
         )
         t0 = time.time()
 
-        try:
-            resp = httpx.post(
-                f"{self.base_url}/chat/completions",
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                timeout=60.0,
-            )
-        except httpx.TimeoutException:
-            raise ValueError(f"Groq request timed out after 60s")
-        except httpx.RequestError as e:
-            raise ValueError(f"Groq connection error: {e}")
-
+        data = self._groq_request(payload)
         elapsed = time.time() - t0
 
-        if resp.status_code != 200:
-            error_body = resp.text[:500]
-            raise ValueError(
-                f"Groq API error {resp.status_code}: {error_body}"
-            )
-
-        data = resp.json()
         choices = data.get("choices", [])
         if not choices:
             raise ValueError("Groq returned no choices")
