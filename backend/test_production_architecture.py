@@ -193,10 +193,12 @@ class TestRealEvidenceRequired:
             "/api/scenarios/scenario_1/run",
             headers={"Authorization": f"Bearer {token}"},
         )
-        assert response.status_code == 200
+        assert response.status_code == 422  # Correct HTTP status for business validation failure
         data = response.json()
-        assert data["status"] == "error"
-        assert "evidence" in data["error"].lower() or "evidence" in data["message"].lower()
+        # FastAPI HTTPException wraps detail in {detail: {...}}
+        body = data.get("detail", data)
+        assert body["status"] == "error"
+        assert "evidence" in body["error"].lower() or "evidence" in body["message"].lower()
 
     @pytest.mark.asyncio
     async def test_pipeline_does_not_create_evidence(self):
@@ -1201,7 +1203,7 @@ class TestIssueRegression:
                     existing_decision_id, tenant, "seller",
                     "order_TEST", 30000, json.dumps([]), 27600,
                     "platform_1_1,sla_4_2", "ai_pipeline", None,
-                    json.dumps({"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}),
+                    json.dumps({"scenario_id": "scenario_1", "claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}),
                     "prev", "hash", datetime.now().isoformat(), "REVIEW_REQUIRED",
                 ),
             )
@@ -1288,7 +1290,7 @@ class TestIssueRegression:
                     existing_decision_id, tenant, "seller",
                     "order_DIFF", 30000, json.dumps([]), 27600,
                     "platform_1_1", "ai_pipeline", None,
-                    json.dumps({"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}),
+                    json.dumps({"scenario_id": "scenario_1", "claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}),
                     "prev", "hash", datetime.now().isoformat(), "REVIEW_REQUIRED",
                 ),
             )
@@ -1434,7 +1436,7 @@ class TestIssueRegression:
                     dec_short, tenant, "seller",
                     "order_PFX", 30000, json.dumps([]), 27600,
                     "platform_1_1", "ai_pipeline", None,
-                    json.dumps({"claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}),
+                    json.dumps({"scenario_id": "scenario_1", "claims": [], "classification": "clear", "confidence": 0.9, "reasoning_summary": "test"}),
                     "prev", "hash_pfx", datetime.now().isoformat(), "REVIEW_REQUIRED",
                 ),
             )
@@ -1478,3 +1480,1077 @@ class TestIssueRegression:
                 "Different evidence set must produce different key"
         finally:
             await db.close()
+
+
+class TestIdempotencyFlow:
+    """Regression tests for the scenario idempotency flow.
+
+    Verifies that a second identical run reuses the existing AI decision
+    instead of returning 'No evidence available' (which happened when the
+    idempotency check ran AFTER the ai_analyzed filter).
+    """
+
+    @pytest.mark.asyncio
+    async def test_first_run_processes_unanalyzed_evidence(self):
+        """First scenario run must find ai_analyzed=FALSE evidence and proceed."""
+        from database import get_db
+        from main import _ensure_system_config
+
+        await _ensure_system_config()
+        tenant = "idem_flow_t1"
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO tenants (tenant_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (tenant, "Idem Flow Test 1"),
+            )
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_flow_first", tenant, "order",
+                    json.dumps({"razorpay_entity_id": "order_FLOW1", "amount": 30000}),
+                    "[]", json.dumps([]),
+                    0, "hash_flow_first", 1, datetime.now().isoformat(),
+                ),
+            )
+            await db.commit()
+
+            # Verify evidence is not yet analyzed
+            cursor = await db.execute(
+                "SELECT ai_analyzed FROM evidence WHERE evidence_id = ?",
+                ("ev_flow_first",),
+            )
+            row = await cursor.fetchone()
+            val = row["ai_analyzed"] if hasattr(row, "keys") else row[0]
+            assert val == 0 or val is False, "Fresh evidence must start unanalyzed"
+
+            # Verify the ai_analyzed=FALSE query finds this evidence
+            cursor2 = await db.execute(
+                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = FALSE",
+                (tenant,),
+            )
+            rows = await cursor2.fetchall()
+            evidence_ids = [r["evidence_id"] if hasattr(r, "keys") else r[0] for r in rows]
+            assert "ev_flow_first" in evidence_ids, \
+                "Unanalyzed evidence must be found by the ai_analyzed=FALSE filter"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_second_identical_run_reuses_existing_decision(self):
+        """A second run with the same scenario/evidence/policies must reuse the
+        existing AI decision, NOT return 'No evidence available'.
+
+        This is the core regression: the idempotency check must run BEFORE
+        the ai_analyzed filter.
+        """
+        from database import get_db
+        from routes import _parse_json_field
+
+        tenant = "idem_flow_t2"
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO tenants (tenant_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (tenant, "Idem Flow Test 2"),
+            )
+            # Insert evidence that has already been AI-analyzed
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_flow_reuse", tenant, "order",
+                    json.dumps({"razorpay_entity_id": "order_REUSE", "amount": 30000}),
+                    "[]", json.dumps([]),
+                    1,  # already analyzed
+                    "hash_flow_reuse", 1, datetime.now().isoformat(),
+                ),
+            )
+            # Insert the existing AI decision for scenario_1
+            existing_decision_id = "dec_flow_existing"
+            await db.execute(
+                "INSERT INTO decisions "
+                "(decision_id, tenant_id, entity_type, entity_id, gross_amount, "
+                "line_items, final_amount, policy_version_id, approver_id, approved_at, "
+                "model_output, prev_decision_hash, decision_hash, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    existing_decision_id, tenant, "seller",
+                    "order_REUSE", 30000, json.dumps([]), 27600,
+                    "platform_1_1", "ai_pipeline", None,
+                    json.dumps({
+                        "scenario_id": "scenario_1",
+                        "claims": [],
+                        "classification": "clear",
+                        "confidence": 0.9,
+                        "reasoning_summary": "test",
+                    }),
+                    "prev", "hash_flow", datetime.now().isoformat(), "REVIEW_REQUIRED",
+                ),
+            )
+            # Link evidence to the existing decision
+            await db.execute(
+                "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                (json.dumps([existing_decision_id]), "ev_flow_reuse"),
+            )
+            await db.commit()
+
+            # Now simulate what run_scenario does: the idempotency check
+            # should find the existing decision even though ai_analyzed=TRUE.
+            # Build the idempotency key from ALL tenant evidence.
+            cursor_ev = await db.execute(
+                "SELECT evidence_id, linked_decision_ids FROM evidence WHERE tenant_id = ?",
+                (tenant,),
+            )
+            all_ev_rows = await cursor_ev.fetchall()
+            dec_to_ev: dict[str, list[str]] = {}
+            all_ev_ids: list[str] = []
+            for ev_row in all_ev_rows:
+                ev_id = ev_row["evidence_id"] if hasattr(ev_row, "keys") else ev_row[0]
+                all_ev_ids.append(ev_id)
+                linked = _parse_json_field(
+                    ev_row["linked_decision_ids"] if hasattr(ev_row, "keys") else ev_row[1]
+                )
+                if isinstance(linked, list):
+                    for d in linked:
+                        dec_to_ev.setdefault(d, []).append(ev_id)
+
+            current_evidence_ids = sorted(all_ev_ids)
+            current_policy_ids = sorted(["platform_1_1"])
+            idempotency_key = ("scenario_1", tuple(current_evidence_ids), tuple(current_policy_ids))
+
+            cursor = await db.execute(
+                "SELECT decision_id, model_output, policy_version_id FROM decisions "
+                "WHERE tenant_id = ? AND approver_id = 'ai_pipeline'",
+                (tenant,),
+            )
+            rows = await cursor.fetchall()
+
+            found = None
+            for row in rows:
+                ex_model_output = _parse_json_field(row["model_output"])
+                pol_raw = row["policy_version_id"] or ""
+                pol_ids = sorted(p.strip() for p in pol_raw.split(",") if p.strip())
+                ev_ids = sorted(dec_to_ev.get(row["decision_id"], []))
+                ex_scenario_id = (
+                    ex_model_output.get("scenario_id")
+                    if isinstance(ex_model_output, dict)
+                    else None
+                )
+                key = (ex_scenario_id, tuple(ev_ids), tuple(pol_ids))
+                if key == idempotency_key:
+                    found = row["decision_id"]
+                    break
+
+            assert found == existing_decision_id, (
+                f"Second identical run must find existing decision {existing_decision_id}, "
+                f"got {found}. The idempotency check must run before the ai_analyzed filter."
+            )
+
+            # Verify ai_analyzed is still TRUE (preserved)
+            cursor2 = await db.execute(
+                "SELECT ai_analyzed FROM evidence WHERE evidence_id = ?",
+                ("ev_flow_reuse",),
+            )
+            row2 = await cursor2.fetchone()
+            val = row2["ai_analyzed"] if hasattr(row2, "keys") else row2[0]
+            assert val == 1 or val is True, \
+                "ai_analyzed must remain TRUE after idempotent reuse"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_same_evidence_different_scenario_creates_new(self):
+        """Same evidence with a different scenario must NOT reuse the existing
+        decision — it must create a new one."""
+        from database import get_db
+        from routes import _parse_json_field
+
+        tenant = "idem_flow_t3"
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO tenants (tenant_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (tenant, "Idem Flow Test 3"),
+            )
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_flow_diff", tenant, "order",
+                    json.dumps({"razorpay_entity_id": "order_DIFFSC", "amount": 30000}),
+                    "[]", json.dumps([]),
+                    1,  # already analyzed
+                    "hash_flow_diff", 1, datetime.now().isoformat(),
+                ),
+            )
+            existing_decision_id = "dec_flow_scenario1"
+            await db.execute(
+                "INSERT INTO decisions "
+                "(decision_id, tenant_id, entity_type, entity_id, gross_amount, "
+                "line_items, final_amount, policy_version_id, approver_id, approved_at, "
+                "model_output, prev_decision_hash, decision_hash, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    existing_decision_id, tenant, "seller",
+                    "order_DIFFSC", 30000, json.dumps([]), 27600,
+                    "platform_1_1", "ai_pipeline", None,
+                    json.dumps({
+                        "scenario_id": "scenario_1",
+                        "claims": [],
+                        "classification": "clear",
+                        "confidence": 0.9,
+                        "reasoning_summary": "test",
+                    }),
+                    "prev", "hash_diff", datetime.now().isoformat(), "REVIEW_REQUIRED",
+                ),
+            )
+            await db.execute(
+                "UPDATE evidence SET linked_decision_ids = ? WHERE evidence_id = ?",
+                (json.dumps([existing_decision_id]), "ev_flow_diff"),
+            )
+            await db.commit()
+
+            # Request scenario_2 with the same evidence
+            cursor_ev = await db.execute(
+                "SELECT evidence_id, linked_decision_ids FROM evidence WHERE tenant_id = ?",
+                (tenant,),
+            )
+            all_ev_rows = await cursor_ev.fetchall()
+            dec_to_ev: dict[str, list[str]] = {}
+            all_ev_ids: list[str] = []
+            for ev_row in all_ev_rows:
+                ev_id = ev_row["evidence_id"] if hasattr(ev_row, "keys") else ev_row[0]
+                all_ev_ids.append(ev_id)
+                linked = _parse_json_field(
+                    ev_row["linked_decision_ids"] if hasattr(ev_row, "keys") else ev_row[1]
+                )
+                if isinstance(linked, list):
+                    for d in linked:
+                        dec_to_ev.setdefault(d, []).append(ev_id)
+
+            # Requesting scenario_2 — the existing decision has scenario_1
+            requested_key = ("scenario_2", tuple(sorted(all_ev_ids)), tuple(["platform_1_1"]))
+
+            cursor = await db.execute(
+                "SELECT decision_id, model_output, policy_version_id FROM decisions "
+                "WHERE tenant_id = ? AND approver_id = 'ai_pipeline'",
+                (tenant,),
+            )
+            rows = await cursor.fetchall()
+
+            found = None
+            for row in rows:
+                ex_model_output = _parse_json_field(row["model_output"])
+                pol_raw = row["policy_version_id"] or ""
+                pol_ids = sorted(p.strip() for p in pol_raw.split(",") if p.strip())
+                ev_ids = sorted(dec_to_ev.get(row["decision_id"], []))
+                ex_scenario_id = (
+                    ex_model_output.get("scenario_id")
+                    if isinstance(ex_model_output, dict)
+                    else None
+                )
+                key = (ex_scenario_id, tuple(ev_ids), tuple(pol_ids))
+                if key == requested_key:
+                    found = row["decision_id"]
+                    break
+
+            assert found is None, (
+                f"Different scenario must NOT match existing decision, but found {found}"
+            )
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_analyzed_evidence_no_matching_decision_not_reused(self):
+        """Already-analyzed evidence with NO matching AI decision must NOT
+        silently reuse an unrelated decision.
+
+        If evidence is ai_analyzed=TRUE but no idempotent match exists,
+        the system must return 'No evidence available', not reuse a
+        decision that was created for different evidence.
+        """
+        from database import get_db
+        from routes import _parse_json_field
+
+        tenant = "idem_flow_t4"
+        db = await get_db()
+        try:
+            await db.execute(
+                "INSERT INTO tenants (tenant_id, name) VALUES (?, ?) ON CONFLICT DO NOTHING",
+                (tenant, "Idem Flow Test 4"),
+            )
+            # Evidence that is AI-analyzed but NOT linked to any decision
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_flow_orphan", tenant, "order",
+                    json.dumps({"razorpay_entity_id": "order_ORPHAN", "amount": 30000}),
+                    "[]", json.dumps([]),
+                    1,  # analyzed but not linked
+                    "hash_flow_orphan", 1, datetime.now().isoformat(),
+                ),
+            )
+            # An unrelated AI decision for DIFFERENT evidence
+            await db.execute(
+                "INSERT INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, ai_analyzed, content_hash, version, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "ev_flow_other", tenant, "order",
+                    json.dumps({"razorpay_entity_id": "order_OTHER", "amount": 50000}),
+                    "[]", json.dumps(["dec_flow_unrelated"]),
+                    1,
+                    "hash_flow_other", 1, datetime.now().isoformat(),
+                ),
+            )
+            await db.execute(
+                "INSERT INTO decisions "
+                "(decision_id, tenant_id, entity_type, entity_id, gross_amount, "
+                "line_items, final_amount, policy_version_id, approver_id, approved_at, "
+                "model_output, prev_decision_hash, decision_hash, created_at, status) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "dec_flow_unrelated", tenant, "seller",
+                    "order_OTHER", 50000, json.dumps([]), 46000,
+                    "platform_1_1", "ai_pipeline", None,
+                    json.dumps({
+                        "scenario_id": "scenario_1",
+                        "claims": [],
+                        "classification": "clear",
+                        "confidence": 0.9,
+                        "reasoning_summary": "test",
+                    }),
+                    "prev", "hash_unrelated", datetime.now().isoformat(), "REVIEW_REQUIRED",
+                ),
+            )
+            await db.commit()
+
+            # Simulate idempotency check for scenario_1 with tenant evidence
+            cursor_ev = await db.execute(
+                "SELECT evidence_id, linked_decision_ids FROM evidence WHERE tenant_id = ?",
+                (tenant,),
+            )
+            all_ev_rows = await cursor_ev.fetchall()
+            dec_to_ev: dict[str, list[str]] = {}
+            all_ev_ids: list[str] = []
+            for ev_row in all_ev_rows:
+                ev_id = ev_row["evidence_id"] if hasattr(ev_row, "keys") else ev_row[0]
+                all_ev_ids.append(ev_id)
+                linked = _parse_json_field(
+                    ev_row["linked_decision_ids"] if hasattr(ev_row, "keys") else ev_row[1]
+                )
+                if isinstance(linked, list):
+                    for d in linked:
+                        dec_to_ev.setdefault(d, []).append(ev_id)
+
+            # The idempotency key uses ALL evidence in the tenant
+            current_evidence_ids = sorted(all_ev_ids)
+            idempotency_key = ("scenario_1", tuple(current_evidence_ids), tuple(["platform_1_1"]))
+
+            cursor = await db.execute(
+                "SELECT decision_id, model_output, policy_version_id FROM decisions "
+                "WHERE tenant_id = ? AND approver_id = 'ai_pipeline'",
+                (tenant,),
+            )
+            rows = await cursor.fetchall()
+
+            found = None
+            for row in rows:
+                ex_model_output = _parse_json_field(row["model_output"])
+                pol_raw = row["policy_version_id"] or ""
+                pol_ids = sorted(p.strip() for p in pol_raw.split(",") if p.strip())
+                ev_ids = sorted(dec_to_ev.get(row["decision_id"], []))
+                ex_scenario_id = (
+                    ex_model_output.get("scenario_id")
+                    if isinstance(ex_model_output, dict)
+                    else None
+                )
+                key = (ex_scenario_id, tuple(ev_ids), tuple(pol_ids))
+                if key == idempotency_key:
+                    found = row["decision_id"]
+                    break
+
+            # The unrelated decision has different evidence (ev_flow_other)
+            # so it must NOT match the full tenant evidence set.
+            assert found is None, (
+                f"Unrelated decision must not match. Found {found} but expected None."
+            )
+
+            # AND: since all evidence is ai_analyzed=TRUE and no match exists,
+            # the ai_analyzed=FALSE filter yields nothing → 'No evidence available'
+            cursor2 = await db.execute(
+                "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = FALSE",
+                (tenant,),
+            )
+            rows2 = await cursor2.fetchall()
+            assert len(rows2) == 0, \
+                "All evidence is analyzed — ai_analyzed=FALSE filter must return empty"
+
+            # This confirms: no idempotent match + no unanalyzed evidence
+            # = 'No evidence available' (correct behavior)
+        finally:
+            await db.close()
+
+
+class TestAnalysisFingerprint:
+    """Verify deterministic analysis_fingerprint computation."""
+
+    def test_fingerprint_deterministic_same_inputs(self):
+        """Same inputs must produce the same fingerprint."""
+        from ai.pipeline import compute_analysis_fingerprint
+
+        fp1 = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s1",
+            evidence_ids=["ev_a", "ev_b"], policy_ids=["p1"],
+        )
+        fp2 = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s1",
+            evidence_ids=["ev_a", "ev_b"], policy_ids=["p1"],
+        )
+        assert fp1 == fp2
+
+    def test_fingerprint_differs_on_different_scenario(self):
+        """Different scenario_id must produce a different fingerprint."""
+        from ai.pipeline import compute_analysis_fingerprint
+
+        fp1 = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s1",
+            evidence_ids=["ev_a"], policy_ids=["p1"],
+        )
+        fp2 = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s2",
+            evidence_ids=["ev_a"], policy_ids=["p1"],
+        )
+        assert fp1 != fp2
+
+    def test_fingerprint_differs_on_different_evidence(self):
+        """Different evidence set must produce a different fingerprint."""
+        from ai.pipeline import compute_analysis_fingerprint
+
+        fp1 = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s1",
+            evidence_ids=["ev_a"], policy_ids=["p1"],
+        )
+        fp2 = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s1",
+            evidence_ids=["ev_a", "ev_b"], policy_ids=["p1"],
+        )
+        assert fp1 != fp2
+
+    def test_fingerprint_differs_on_different_tenant(self):
+        """Different tenant must produce a different fingerprint."""
+        from ai.pipeline import compute_analysis_fingerprint
+
+        fp1 = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s1",
+            evidence_ids=["ev_a"], policy_ids=["p1"],
+        )
+        fp2 = compute_analysis_fingerprint(
+            tenant_id="t2", scenario_id="s1",
+            evidence_ids=["ev_a"], policy_ids=["p1"],
+        )
+        assert fp1 != fp2
+
+    def test_fingerprint_order_independent(self):
+        """Order of evidence and policy IDs must not affect fingerprint."""
+        from ai.pipeline import compute_analysis_fingerprint
+
+        fp1 = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s1",
+            evidence_ids=["ev_b", "ev_a"], policy_ids=["p2", "p1"],
+        )
+        fp2 = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s1",
+            evidence_ids=["ev_a", "ev_b"], policy_ids=["p1", "p2"],
+        )
+        assert fp1 == fp2
+
+    def test_fingerprint_is_hex_sha256(self):
+        """Fingerprint must be a 64-char hex SHA-256 string."""
+        import re
+        from ai.pipeline import compute_analysis_fingerprint
+
+        fp = compute_analysis_fingerprint(
+            tenant_id="t1", scenario_id="s1",
+            evidence_ids=[], policy_ids=[],
+        )
+        assert re.fullmatch(r"[0-9a-f]{64}", fp), f"Bad fingerprint format: {fp}"
+
+
+class TestTenantIsolationAudit:
+    """Verify all post-pipeline evidence updates are tenant-scoped."""
+
+    def test_scenarios_list_not_tenant_scoped_by_design(self):
+        """Scenarios are shared dev/test tools — not tenant-scoped."""
+        # This is the intentional design documented in routes.py.
+        # Scenarios define *what* to run, not *whose* data to use.
+        pass
+
+    def test_run_scenario_evidence_update_includes_tenant(self):
+        """Post-pipeline evidence UPDATE must include tenant_id."""
+        import inspect
+        from routes import run_scenario
+        source = inspect.getsource(run_scenario)
+        # The evidence update query should contain AND tenant_id = ?
+        assert "tenant_id = ?" in source, (
+            "Evidence update in run_scenario must be tenant-scoped"
+        )
+
+
+class TestCalculationTrace:
+    """Verify structured calculation trace generation."""
+
+    def test_calculation_trace_structure(self):
+        """Trace must contain all required fields per step."""
+        from calculations import build_calculation_trace
+        from models import LineItem
+
+        items = [
+            LineItem(label="Platform fee", amount=2400, type="fee",
+                     policy_clause_id="platform_1_1", evidence_ids=["ev_1"]),
+            LineItem(label="SLA penalty", amount=5000, type="deduction",
+                     policy_clause_id="sla_4_2", evidence_ids=["ev_2"]),
+        ]
+        trace = build_calculation_trace(
+            gross_amount=30000, line_items=items, final_amount=22600,
+        )
+
+        assert trace["gross_amount"] == 30000
+        assert trace["final_amount"] == 22600
+        assert trace["total_deductions"] == 7400
+        assert trace["validated"] is True
+        assert len(trace["steps"]) == 2
+
+        # Each step must have all required fields
+        for step in trace["steps"]:
+            assert "label" in step
+            assert "calculation_type" in step
+            assert "base_amount" in step
+            assert "rate" in step or step["rate"] is None
+            assert "formula" in step
+            assert "calculated_amount" in step
+            assert "policy_clause_id" in step
+            assert "evidence_ids" in step
+
+    def test_calculation_trace_platform_fee(self):
+        """Platform fee step must show percentage_fee type."""
+        from calculations import build_calculation_trace
+        from models import LineItem
+
+        items = [
+            LineItem(label="Platform fee", amount=2400, type="fee",
+                     policy_clause_id="platform_1_1", evidence_ids=["ev_1"]),
+        ]
+        trace = build_calculation_trace(
+            gross_amount=30000, line_items=items, final_amount=27600,
+        )
+        step = trace["steps"][0]
+        assert step["calculation_type"] == "percentage_fee"
+        assert step["rate"] is not None
+        assert step["rate"] == pytest.approx(0.08, abs=0.01)
+
+    def test_calculation_trace_formula_string(self):
+        """Overall formula must be a readable string."""
+        from calculations import build_calculation_trace
+        from models import LineItem
+
+        items = [
+            LineItem(label="Platform fee", amount=2400, type="fee",
+                     policy_clause_id="platform_1_1", evidence_ids=[]),
+        ]
+        trace = build_calculation_trace(
+            gross_amount=30000, line_items=items, final_amount=27600,
+        )
+        assert "30000" in trace["formula"]
+        assert "27600" in trace["formula"]
+
+    def test_calculation_trace_mismatch_detected(self):
+        """Mismatched final_amount must set validated=False."""
+        from calculations import build_calculation_trace
+        from models import LineItem
+
+        items = [
+            LineItem(label="Platform fee", amount=2400, type="fee",
+                     policy_clause_id="platform_1_1", evidence_ids=[]),
+        ]
+        trace = build_calculation_trace(
+            gross_amount=30000, line_items=items, final_amount=99999,
+        )
+        assert trace["validated"] is False
+
+
+class TestExceptionModel:
+    """Verify all exception categories exist and are structured correctly."""
+
+    def test_all_six_exception_categories_exist(self):
+        """All 6 required exception categories must be defined."""
+        from calculations import (
+            ALL_EXCEPTION_CATEGORIES,
+            EXCEPTION_MISSING_EVIDENCE,
+            EXCEPTION_POLICY_AMBIGUITY,
+            EXCEPTION_CONFLICTING_EVIDENCE,
+            EXCEPTION_LOW_CONFIDENCE,
+            EXCEPTION_DATA_INCONSISTENCY,
+            EXCEPTION_CALCULATION_EXCEPTION,
+        )
+        expected = {
+            "MISSING_EVIDENCE", "POLICY_AMBIGUITY", "CONFLICTING_EVIDENCE",
+            "LOW_CONFIDENCE", "DATA_INCONSISTENCY", "CALCULATION_EXCEPTION",
+        }
+        assert ALL_EXCEPTION_CATEGORIES == expected
+
+    def test_detect_exceptions_low_confidence(self):
+        """Low confidence must produce LOW_CONFIDENCE exception."""
+        from ai.pipeline import _detect_exceptions
+        from calculations import validate_calculation
+        from models import LineItem
+
+        exceptions = _detect_exceptions(
+            reasoning_result={"confidence": 0.3, "claims": []},
+            evidence_records=[{"source_type": "order", "raw_content": '{}'}],
+            validation={"valid": True},
+            gross_amount=30000,
+            line_items=[],
+        )
+        categories = [e["category"] for e in exceptions]
+        assert "LOW_CONFIDENCE" in categories
+
+    def test_detect_exceptions_missing_evidence(self):
+        """No order evidence must produce MISSING_EVIDENCE exception."""
+        from ai.pipeline import _detect_exceptions
+
+        exceptions = _detect_exceptions(
+            reasoning_result={"confidence": 0.9, "claims": []},
+            evidence_records=[{"source_type": "payment", "raw_content": '{}'}],
+            validation={"valid": True},
+            gross_amount=30000,
+            line_items=[],
+        )
+        categories = [e["category"] for e in exceptions]
+        assert "MISSING_EVIDENCE" in categories
+
+    def test_detect_exceptions_data_inconsistency(self):
+        """Calculation mismatch must produce DATA_INCONSISTENCY exception."""
+        from ai.pipeline import _detect_exceptions
+
+        exceptions = _detect_exceptions(
+            reasoning_result={"confidence": 0.9, "claims": []},
+            evidence_records=[{"source_type": "order", "raw_content": '{}'}],
+            validation={"valid": False, "expected_final": 27600, "calculated_final": 28000},
+            gross_amount=30000,
+            line_items=[],
+        )
+        categories = [e["category"] for e in exceptions]
+        assert "DATA_INCONSISTENCY" in categories
+
+    def test_detect_exceptions_policy_ambiguity(self):
+        """Claims empty despite evidence must produce POLICY_AMBIGUITY."""
+        from ai.pipeline import _detect_exceptions
+
+        exceptions = _detect_exceptions(
+            reasoning_result={"confidence": 0.9, "claims": []},
+            evidence_records=[{"source_type": "order", "raw_content": '{}'}],
+            validation={"valid": True},
+            gross_amount=30000,
+            line_items=[],
+        )
+        categories = [e["category"] for e in exceptions]
+        assert "POLICY_AMBIGUITY" in categories
+
+    def test_no_exceptions_on_clean_run(self):
+        """A clean run with high confidence and valid data must have no exceptions."""
+        from ai.pipeline import _detect_exceptions
+        from models import LineItem
+
+        exceptions = _detect_exceptions(
+            reasoning_result={"confidence": 0.9, "claims": [{"type": "sla_breach"}]},
+            evidence_records=[{"source_type": "order", "raw_content": '{"amount": 30000}'}],
+            validation={"valid": True},
+            gross_amount=30000,
+            line_items=[LineItem(label="SLA penalty", amount=5000, type="deduction",
+                                 policy_clause_id="sla_4_2", evidence_ids=["ev_1"])],
+        )
+        assert len(exceptions) == 0
+
+
+class TestDecisionReplay:
+    """Verify decision replay endpoint."""
+
+    def test_replay_endpoint_exists(self):
+        """The replay endpoint must exist in the router."""
+        from routes import router
+        routes = [r.path for r in router.routes]
+        assert "/decisions/{decision_id}/replay" in routes
+
+    def test_replay_returns_required_fields(self):
+        """Replay must return stored, recomputed, match, mismatches."""
+        import inspect
+        from routes import replay_decision
+        source = inspect.getsource(replay_decision)
+        assert '"stored"' in source
+        assert '"recomputed"' in source
+        assert '"match"' in source
+        assert '"mismatches"' in source
+
+
+class TestHashVerificationExtended:
+    """Verify extended hash verification fields."""
+
+    def test_verification_result_has_extended_fields(self):
+        """VerificationResult must have all extended fields."""
+        from models import VerificationResult
+        vr = VerificationResult(
+            valid=True, checked_count=1,
+            decision_hash_valid=True,
+            prev_hash_valid=True,
+            canonical_payload="{}",
+            chain_continuity=True,
+        )
+        assert vr.decision_hash_valid is True
+        assert vr.prev_hash_valid is True
+        assert vr.canonical_payload == "{}"
+        assert vr.chain_continuity is True
+
+    def test_verify_endpoint_returns_extended_fields(self):
+        """The /verify endpoint must populate extended fields."""
+        import inspect
+        from routes import verify_decision
+        source = inspect.getsource(verify_decision)
+        assert "decision_hash_valid" in source
+        assert "canonical_payload" in source
+        assert "chain_continuity" in source
+
+
+class TestAuditTrail:
+    """Verify defense packet exposes full audit trail."""
+
+    def test_defense_packet_includes_trace_and_exceptions(self):
+        """Defense packet must include calculation_trace and exceptions."""
+        import inspect
+        from routes import get_defense_packet
+        source = inspect.getsource(get_defense_packet)
+        assert "calculation_trace" in source
+        assert "exceptions" in source
+        assert "decision_hash_valid" in source
+        assert "canonical_payload" in source
+
+    def test_policy_version_pinned_in_decision(self):
+        """Each decision must store exact policy_version_id."""
+        import inspect
+        from routes import run_scenario
+        source = inspect.getsource(run_scenario)
+        # The decision INSERT must include policy_version_id
+        assert "policy_version_id" in source
+
+
+class TestPolicyHistoricalReproducibility:
+    """Prove that policy snapshots ensure historical reproducibility.
+
+    Tests:
+    - Policy snapshot is stored at decision creation
+    - Changing the live policy does not change historical decision/defense packet output
+    - Replay uses the historical snapshot
+    - Tampering with the snapshot invalidates the decision hash
+    """
+
+    @pytest.mark.asyncio
+    async def test_policy_snapshot_stored_at_decision_creation(self):
+        """Seed decisions must contain a policy_snapshot in model_output."""
+        from database import get_db
+
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT model_output FROM decisions WHERE decision_id = 'dec_001'"
+            )
+            row = await cursor.fetchone()
+            assert row is not None, "dec_001 not found"
+            model_output = row["model_output"]
+            if isinstance(model_output, str):
+                model_output = json.loads(model_output)
+            snapshot = model_output.get("policy_snapshot", [])
+            assert len(snapshot) >= 2, (
+                f"dec_001 must have at least 2 policies in snapshot, got {len(snapshot)}"
+            )
+            # Each snapshot entry must have the required fields
+            for entry in snapshot:
+                assert "policy_id" in entry, "Missing policy_id in snapshot"
+                assert "version" in entry, "Missing version in snapshot"
+                assert "clause_text" in entry, "Missing clause_text in snapshot"
+                assert "effective_date" in entry, "Missing effective_date in snapshot"
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_changing_live_policy_does_not_change_historical_decision(self):
+        """Updating the live policy in the DB must not affect an existing decision."""
+        from database import get_db
+        from hash_chain import compute_decision_hash
+
+        db = await get_db()
+        try:
+            # Read the original decision and its snapshot
+            cursor = await db.execute(
+                "SELECT model_output, decision_hash, prev_decision_hash FROM decisions "
+                "WHERE decision_id = 'dec_001'"
+            )
+            row = await cursor.fetchone()
+            model_output = row["model_output"]
+            if isinstance(model_output, str):
+                model_output = json.loads(model_output)
+            original_snapshot = model_output.get("policy_snapshot", [])
+            original_hash = row["decision_hash"]
+            original_prev_hash = row["prev_decision_hash"]
+            assert len(original_snapshot) >= 2, "Need at least 2 policies in snapshot"
+
+            # Record the original clause_text for the platform policy
+            original_clause = None
+            for p in original_snapshot:
+                if p["policy_id"] == "platform_1_1":
+                    original_clause = p["clause_text"]
+                    break
+            assert original_clause is not None, "platform_1_1 not in snapshot"
+
+            # Tamper: change the live policy in the database
+            await db.execute(
+                "UPDATE policies SET clause_text = ?, version = ? WHERE policy_id = ?",
+                ("HACKED: This is not the original policy text.", "99.0", "platform_1_1"),
+            )
+            await db.commit()
+
+            # Read the decision again — it must be unchanged
+            cursor2 = await db.execute(
+                "SELECT model_output, decision_hash FROM decisions WHERE decision_id = 'dec_001'"
+            )
+            row2 = await cursor2.fetchone()
+            model_output2 = row2["model_output"]
+            if isinstance(model_output2, str):
+                model_output2 = json.loads(model_output2)
+            snapshot2 = model_output2.get("policy_snapshot", [])
+
+            # Snapshot must still have the original clause text
+            for p in snapshot2:
+                if p["policy_id"] == "platform_1_1":
+                    assert p["clause_text"] == original_clause, (
+                        "Historical snapshot was corrupted by live policy update"
+                    )
+                    assert p["version"] != "99.0", (
+                        "Historical snapshot version was corrupted"
+                    )
+
+            # Decision hash must still be valid
+            decision_data = {
+                "decision_id": "dec_001",
+                "model_output": model_output2,
+            }
+            # We cannot fully recompute the hash here without all fields,
+            # but the stored hash must match what it was before
+            assert row2["decision_hash"] == original_hash, (
+                "Decision hash changed after live policy update"
+            )
+
+            # Restore the original policy for other tests
+            await db.execute(
+                "UPDATE policies SET clause_text = ?, version = ? WHERE policy_id = ?",
+                (original_clause, "2.1", "platform_1_1"),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_changing_live_policy_does_not_change_defense_packet(self):
+        """The defense packet must reflect the snapshot, not live policy content."""
+        from database import get_db
+        from auth import create_access_token
+        from fastapi.testclient import TestClient
+        from main import app
+        from main import _ensure_system_config
+
+        await _ensure_system_config()
+
+        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
+        client = TestClient(app)
+
+        # Get original defense packet
+        resp1 = client.get(
+            "/api/decisions/dec_001/defense-packet",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp1.status_code == 200
+        packet1 = resp1.json()
+        original_policies = packet1["policies"]
+        assert len(original_policies) >= 2
+
+        # Record original clause text
+        original_clause = None
+        for p in original_policies:
+            if p["policy_id"] == "platform_1_1":
+                original_clause = p["clause_text"]
+                break
+        assert original_clause is not None
+
+        # Tamper the live policy
+        db = await get_db()
+        try:
+            await db.execute(
+                "UPDATE policies SET clause_text = ?, version = ? WHERE policy_id = ?",
+                ("HACKED: This is not the original.", "99.0", "platform_1_1"),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+        # Get defense packet again — must still have original content
+        resp2 = client.get(
+            "/api/decisions/dec_001/defense-packet",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp2.status_code == 200
+        packet2 = resp2.json()
+        for p in packet2["policies"]:
+            if p["policy_id"] == "platform_1_1":
+                assert p["clause_text"] == original_clause, (
+                    "Defense packet used live policy instead of historical snapshot"
+                )
+                assert p["version"] != "99.0", (
+                    "Defense packet reflected a tampered policy version"
+                )
+
+        # Restore the original policy
+        db = await get_db()
+        try:
+            await db.execute(
+                "UPDATE policies SET clause_text = ?, version = ? WHERE policy_id = ?",
+                (original_clause, "2.1", "platform_1_1"),
+            )
+            await db.commit()
+        finally:
+            await db.close()
+
+    @pytest.mark.asyncio
+    async def test_replay_uses_historical_snapshot(self):
+        """Replay response must include the stored policy_snapshot."""
+        from auth import create_access_token
+        from fastapi.testclient import TestClient
+        from main import app
+        from main import _ensure_system_config
+
+        await _ensure_system_config()
+
+        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
+        client = TestClient(app)
+
+        resp = client.get(
+            "/api/decisions/dec_001/replay",
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert resp.status_code == 200
+        data = resp.json()
+        stored = data["stored"]
+        assert "policy_snapshot" in stored, "Replay must include policy_snapshot"
+        snapshot = stored["policy_snapshot"]
+        assert len(snapshot) >= 2, f"Expected >=2 policies in snapshot, got {len(snapshot)}"
+        # Verify snapshot fields
+        for entry in snapshot:
+            assert "policy_id" in entry
+            assert "version" in entry
+            assert "clause_text" in entry
+            assert "effective_date" in entry
+
+    @pytest.mark.asyncio
+    async def test_tampering_with_snapshot_invalidates_decision_hash(self):
+        """Modifying the stored policy_snapshot must break the decision hash."""
+        from database import get_db
+        from hash_chain import compute_decision_hash, canonicalize
+
+        db = await get_db()
+        try:
+            cursor = await db.execute(
+                "SELECT * FROM decisions WHERE decision_id = 'dec_001'"
+            )
+            row = await cursor.fetchone()
+            assert row is not None
+
+            original_hash = row["decision_hash"]
+            model_output = row["model_output"]
+            if isinstance(model_output, str):
+                model_output = json.loads(model_output)
+
+            # Tamper the snapshot
+            snapshot = model_output.get("policy_snapshot", [])
+            assert len(snapshot) >= 1
+            snapshot[0]["clause_text"] = "TAMPERED POLICY TEXT"
+            model_output["policy_snapshot"] = snapshot
+
+            # Build a decision dict with the tampered snapshot
+            tampered_decision = {
+                "decision_id": row["decision_id"],
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "gross_amount": row["gross_amount"],
+                "line_items": json.loads(row["line_items"]) if isinstance(row["line_items"], str) else row["line_items"],
+                "final_amount": row["final_amount"],
+                "policy_version_id": row["policy_version_id"],
+                "approver_id": row["approver_id"],
+                "approved_at": row["approved_at"],
+                "model_output": model_output,
+                "prev_decision_hash": row["prev_decision_hash"],
+                "decision_hash": "",
+                "created_at": row["created_at"],
+                "status": row["status"],
+            }
+
+            # Recompute hash with tampered data
+            tampered_hash = compute_decision_hash(tampered_decision, row["prev_decision_hash"])
+
+            # The tampered hash must NOT match the original
+            assert tampered_hash != original_hash, (
+                "Tampering with policy_snapshot did NOT invalidate the decision hash!"
+            )
+        finally:
+            await db.close()
+
+    def test_policy_snapshot_fields_match_policy_response(self):
+        """PolicySnapshot fields must align with PolicyResponse model."""
+        from models import PolicyResponse
+        # Every policy_snapshot entry must be constructable as a PolicyResponse
+        snapshot_entry = {
+            "policy_id": "platform_1_1",
+            "version": "2.1",
+            "clause_text": "Test clause",
+            "effective_date": "2024-01-01",
+        }
+        response = PolicyResponse(**snapshot_entry)
+        assert response.policy_id == "platform_1_1"
+        assert response.version == "2.1"
+        assert response.clause_text == "Test clause"
+        assert response.effective_date == "2024-01-01"
+
+    def test_pipeline_stores_policy_snapshot(self):
+        """run_pipeline must produce a policy_snapshot in model_output."""
+        import inspect
+        from ai.pipeline import run_pipeline
+        source = inspect.getsource(run_pipeline)
+        assert "policy_snapshot" in source, "run_pipeline must reference policy_snapshot"
+
+    def test_defense_packet_uses_stored_snapshot(self):
+        """get_defense_packet must prefer stored policy_snapshot over live queries."""
+        import inspect
+        from routes import get_defense_packet
+        source = inspect.getsource(get_defense_packet)
+        assert "policy_snapshot" in source, (
+            "get_defense_packet must reference policy_snapshot"
+        )

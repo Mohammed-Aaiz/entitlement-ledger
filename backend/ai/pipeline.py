@@ -3,6 +3,7 @@
 Coordinates the full flow:
 Evidence → Extraction → Reasoning → Deterministic Calculation → Decision → Hash Chain
 """
+import hashlib
 import os
 import logging
 import time
@@ -12,13 +13,45 @@ from datetime import datetime
 from typing import Optional
 
 from models import LineItem
-from calculations import build_line_items, calculate_final_amount, validate_calculation
+from calculations import (
+    build_line_items, calculate_final_amount, validate_calculation,
+    build_calculation_trace,
+    EXCEPTION_MISSING_EVIDENCE, EXCEPTION_LOW_CONFIDENCE,
+    EXCEPTION_CONFLICTING_EVIDENCE, EXCEPTION_DATA_INCONSISTENCY,
+)
 from hash_chain import compute_decision_hash
 from ai.extraction import extract_facts_from_evidence
 from ai.reasoning import reason_about_claims
 from ai.llm_provider import is_ai_available
 
 logger = logging.getLogger(__name__)
+
+
+def compute_analysis_fingerprint(
+    tenant_id: str,
+    scenario_id: str,
+    evidence_ids: list[str],
+    policy_ids: list[str],
+) -> str:
+    """Compute a deterministic SHA-256 fingerprint for an analysis request.
+
+    The fingerprint uniquely identifies the combination of:
+      tenant_id + scenario_id + sorted evidence IDs + sorted policy IDs
+
+    This is used for idempotency: two identical fingerprints mean the
+    same analysis was already performed.
+    """
+    canonical = json.dumps(
+        {
+            "tenant_id": tenant_id,
+            "scenario_id": scenario_id,
+            "evidence_ids": sorted(evidence_ids),
+            "policy_ids": sorted(policy_ids),
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 def _map_claims_to_calculation_params(claims: list[dict]) -> dict:
@@ -90,6 +123,7 @@ def run_pipeline(
     policy_records: list[dict],
     prev_decision_hash: str = "genesis",
     use_mock: bool = False,
+    agent_result: dict | None = None,
 ) -> dict:
     """Execute the full AI pipeline for a scenario.
 
@@ -99,6 +133,10 @@ def run_pipeline(
         policy_records: List of policy dicts
         prev_decision_hash: Hash of previous decision in chain
         use_mock: If True, use mock extraction/reasoning (for tests only)
+        agent_result: If provided, skip extraction+reasoning and use the
+            Finance Controller Agent's structured analysis.  The agent's
+            output must contain 'analysis' (claims, classification, etc.)
+            and 'extracted_facts'.
 
     Returns:
         Complete decision dict with hash chain
@@ -109,69 +147,96 @@ def run_pipeline(
     available_evidence_ids = [ev["evidence_id"] for ev in evidence_records]
     available_policy_ids = [p["policy_id"] for p in policy_records]
 
-    # Stage 1: Extract facts from each evidence document
-    stage_start = time.time()
-    all_extracted_facts = []
-    for ev in evidence_records:
-        if use_mock:
-            from ai.test_mocks import extract_facts_mock
-            extracted = extract_facts_mock(
-                ev["evidence_id"],
-                ev["source_type"],
-                ev["raw_content"],
-            )
-        else:
-            extracted = extract_facts_from_evidence(
-                ev["evidence_id"],
-                ev["source_type"],
-                ev["raw_content"],
-            )
+    # ── Stages 1+2: Extraction + Reasoning ──
+    # When an agent_result is provided, the Finance Controller Agent has
+    # already performed evidence gathering, tool calls, and structured
+    # reasoning.  We use its output directly — no redundant LLM calls.
+    if agent_result is not None:
+        stage_start = time.time()
+        all_extracted_facts = agent_result.get("extracted_facts", [])
+        analysis = agent_result["analysis"]
+        reasoning_result = {
+            "claims": analysis.get("claims", []),
+            "classification": analysis.get("classification", "exception"),
+            "confidence": analysis.get("confidence", 0.0),
+            "reasoning_summary": analysis.get("reasoning_summary", ""),
+        }
+        # Merge agent state into stage durations for audit
+        agent_state = agent_result.get("agent_state")
+        if agent_state:
+            stage_durations["agent"] = {
+                "duration_ms": getattr(agent_state, "duration_ms", 0),
+                "iterations": getattr(agent_state, "iteration_count", 0),
+                "tool_calls": len(getattr(agent_state, "tools_called", [])),
+                "stop_reason": getattr(agent_state, "stop_reason", "unknown"),
+            }
+        stage_durations["extraction"] = 0  # Agent subsumes extraction
+        stage_durations["reasoning"] = 0   # Agent subsumes reasoning
+    else:
+        # Legacy path: extraction + reasoning via LLM (or mock)
+        # Stage 1: Extract facts from each evidence document
+        stage_start = time.time()
+        all_extracted_facts = []
+        for ev in evidence_records:
+            if use_mock:
+                from ai.test_mocks import extract_facts_mock
+                extracted = extract_facts_mock(
+                    ev["evidence_id"],
+                    ev["source_type"],
+                    ev["raw_content"],
+                )
+            else:
+                extracted = extract_facts_from_evidence(
+                    ev["evidence_id"],
+                    ev["source_type"],
+                    ev["raw_content"],
+                )
 
-        # Update evidence record with extracted facts
-        ev["extracted_facts"] = extracted["facts"]
-        all_extracted_facts.extend([
-            {**fact, "source_evidence_id": ev["evidence_id"]}
-            for fact in extracted["facts"]
-        ])
+            # Update evidence record with extracted facts
+            ev["extracted_facts"] = extracted["facts"]
+            all_extracted_facts.extend([
+                {**fact, "source_evidence_id": ev["evidence_id"]}
+                for fact in extracted["facts"]
+            ])
+
+            logger.info(
+                "Extracted %d facts from %s",
+                len(extracted["facts"]),
+                ev["evidence_id"],
+            )
+        stage_durations["extraction"] = time.time() - stage_start
+
+        # Stage 2: Reason about claims
+        stage_start = time.time()
+        combined_facts = {"facts": all_extracted_facts}
+
+        if use_mock:
+            from ai.test_mocks import reason_about_claims_mock
+
+            # Determine scenario type from evidence
+            has_delivery = any(ev["source_type"] == "delivery" for ev in evidence_records)
+            has_refund = any(ev["source_type"] == "refund_record" for ev in evidence_records)
+            has_complaint = any(ev["source_type"] == "complaint" for ev in evidence_records)
+
+            if has_refund and has_delivery:
+                scenario_type = "clear"
+            elif has_delivery:
+                scenario_type = "sla_only"
+            elif has_complaint:
+                scenario_type = "no_penalty"
+            else:
+                scenario_type = "no_issues"
+
+            reasoning_result = reason_about_claims_mock(combined_facts, policy_records, scenario_type)
+        else:
+            reasoning_result = reason_about_claims(combined_facts, policy_records)
 
         logger.info(
-            "Extracted %d facts from %s",
-            len(extracted["facts"]),
-            ev["evidence_id"],
+            "Reasoning result: classification=%s, claims=%d",
+            reasoning_result["classification"],
+            len(reasoning_result["claims"]),
         )
-    stage_durations["extraction"] = time.time() - stage_start
-
-    # Stage 2: Reason about claims
-    stage_start = time.time()
-    combined_facts = {"facts": all_extracted_facts}
-
-    if use_mock:
-        from ai.test_mocks import reason_about_claims_mock
-
-        # Determine scenario type from evidence
-        has_delivery = any(ev["source_type"] == "delivery" for ev in evidence_records)
-        has_refund = any(ev["source_type"] == "refund_record" for ev in evidence_records)
-        has_complaint = any(ev["source_type"] == "complaint" for ev in evidence_records)
-
-        if has_refund and has_delivery:
-            scenario_type = "clear"
-        elif has_delivery:
-            scenario_type = "sla_only"
-        elif has_complaint:
-            scenario_type = "no_penalty"
-        else:
-            scenario_type = "no_issues"
-
-        reasoning_result = reason_about_claims_mock(combined_facts, policy_records, scenario_type)
-    else:
-        reasoning_result = reason_about_claims(combined_facts, policy_records)
-
-    logger.info(
-        "Reasoning result: classification=%s, claims=%d",
-        reasoning_result["classification"],
-        len(reasoning_result["claims"]),
-    )
-    stage_durations["reasoning"] = time.time() - stage_start
+        stage_durations["reasoning"] = time.time() - stage_start
 
     # Stage 3: Validate references
     stage_start = time.time()
@@ -237,6 +302,35 @@ def run_pipeline(
 
     stage_durations["calculation"] = time.time() - stage_start
 
+    # Build calculation trace for auditability
+    calculation_trace = build_calculation_trace(
+        gross_amount=gross_amount,
+        line_items=line_items,
+        final_amount=final_amount,
+    )
+
+    # Detect exceptions
+    exceptions = _detect_exceptions(
+        reasoning_result=reasoning_result,
+        evidence_records=evidence_records,
+        validation=validation,
+        gross_amount=gross_amount,
+        line_items=line_items,
+    )
+
+    # Build immutable policy snapshot for historical reproducibility.
+    # Each decision captures the exact policy content that was in effect,
+    # so that old decisions are never affected by future policy updates.
+    policy_snapshot = [
+        {
+            "policy_id": p["policy_id"],
+            "version": p["version"],
+            "clause_text": p["clause_text"],
+            "effective_date": p["effective_date"],
+        }
+        for p in policy_records
+    ]
+
     # Stage 5: Create decision
     stage_start = time.time()
     decision_id = f"dec_{uuid.uuid4().hex[:8]}"
@@ -254,26 +348,39 @@ def run_pipeline(
         "approved_at": None,  # Not approved yet - REVIEW_REQUIRED
         "model_output": {
             "scenario_id": scenario_id,
+            "analysis_fingerprint": compute_analysis_fingerprint(
+                tenant_id="",  # tenant_id is set by routes.py after pipeline
+                scenario_id=scenario_id,
+                evidence_ids=available_evidence_ids,
+                policy_ids=available_policy_ids,
+            ),
             "claims": reasoning_result["claims"],
             "classification": reasoning_result["classification"],
             "confidence": reasoning_result["confidence"],
             "reasoning_summary": reasoning_result["reasoning_summary"],
             "extracted_facts_count": len(all_extracted_facts),
+            "calculation_trace": calculation_trace,
+            "exceptions": exceptions,
+            "policy_snapshot": policy_snapshot,
         },
         "prev_decision_hash": prev_decision_hash,
         "decision_hash": "",
         "created_at": now,
         "status": "REVIEW_REQUIRED",  # AI decisions must be reviewed
-        "pipeline_stages": {
-            "extraction": {"duration_ms": int(stage_durations["extraction"] * 1000)},
-            "reasoning": {"duration_ms": int(stage_durations["reasoning"] * 1000)},
-            "validation": {"duration_ms": int(stage_durations["validation"] * 1000)},
-            "calculation": {"duration_ms": int(stage_durations["calculation"] * 1000)},
-        },
     }
 
-    # Compute hash
+    # Compute hash BEFORE adding pipeline_stages (which is not persisted
+    # to the DB and must not be part of the hash input).
     decision_data["decision_hash"] = compute_decision_hash(decision_data, prev_decision_hash)
+
+    # Add pipeline_stages AFTER hashing — this is audit metadata only,
+    # returned in the API response but not stored in the decisions table.
+    decision_data["pipeline_stages"] = {
+        "extraction": {"duration_ms": int(stage_durations["extraction"] * 1000)},
+        "reasoning": {"duration_ms": int(stage_durations["reasoning"] * 1000)},
+        "validation": {"duration_ms": int(stage_durations["validation"] * 1000)},
+        "calculation": {"duration_ms": int(stage_durations["calculation"] * 1000)},
+    }
     stage_durations["commit"] = time.time() - stage_start
 
     total_duration = time.time() - start_time
@@ -300,6 +407,80 @@ def run_pipeline(
         "stages": stage_durations,
         "total_duration_ms": int(total_duration * 1000),
     }
+
+
+def _detect_exceptions(
+    reasoning_result: dict,
+    evidence_records: list[dict],
+    validation: dict,
+    gross_amount: int,
+    line_items: list,
+) -> list[dict]:
+    """Detect structured exceptions from the pipeline run.
+
+    Returns a list of exception dicts, each with:
+      - category: one of the EXCEPTION_* constants
+      - message: human-readable explanation
+      - severity: "warning" or "critical"
+    """
+    exceptions = []
+
+    # LOW_CONFIDENCE: confidence below 0.6
+    confidence = reasoning_result.get("confidence", 1.0)
+    if confidence < 0.6:
+        exceptions.append({
+            "category": EXCEPTION_LOW_CONFIDENCE,
+            "message": f"AI confidence is {confidence:.2f}, below 0.6 threshold",
+            "severity": "warning",
+        })
+
+    # MISSING_EVIDENCE: no order evidence found
+    has_order = any(ev["source_type"] == "order" for ev in evidence_records)
+    if not has_order:
+        exceptions.append({
+            "category": EXCEPTION_MISSING_EVIDENCE,
+            "message": "No order evidence found in the evidence set",
+            "severity": "critical",
+        })
+
+    # CONFLICTING_EVIDENCE: multiple conflicting claims
+    claims = reasoning_result.get("claims", [])
+    claim_types = [c.get("type", "") for c in claims]
+    if "sla_breach" in claim_types and "sla_met" in claim_types:
+        exceptions.append({
+            "category": EXCEPTION_CONFLICTING_EVIDENCE,
+            "message": "Conflicting SLA breach and SLA met claims detected",
+            "severity": "warning",
+        })
+
+    # DATA_INCONSISTENCY: gross amount is 0 or negative
+    if gross_amount <= 0:
+        exceptions.append({
+            "category": EXCEPTION_DATA_INCONSISTENCY,
+            "message": f"Gross amount is {gross_amount}, expected positive value",
+            "severity": "critical",
+        })
+
+    # DATA_INCONSISTENCY: calculation validation failed
+    if not validation.get("valid", True):
+        exceptions.append({
+            "category": EXCEPTION_DATA_INCONSISTENCY,
+            "message": (
+                f"Calculation mismatch: expected {validation.get('expected_final')}, "
+                f"got {validation.get('calculated_final')}"
+            ),
+            "severity": "critical",
+        })
+
+    # POLICY_AMBIGUITY: no claims matched any policy
+    if not claims and evidence_records:
+        exceptions.append({
+            "category": "POLICY_AMBIGUITY",
+            "message": "No claims extracted despite evidence being present",
+            "severity": "warning",
+        })
+
+    return exceptions
 
 
 def _extract_seller_id(evidence_records: list[dict]) -> str:

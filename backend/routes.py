@@ -19,8 +19,10 @@ from models import (
     DecisionResponse, EvidenceResponse, PolicyResponse,
     VerificationResult, ScenarioResponse, DefensePacket, LineItem,
 )
+import hash_chain
 from hash_chain import verify_chain, compute_decision_hash
 from calculations import validate_calculation, build_line_items, calculate_final_amount
+from ai.pipeline import compute_analysis_fingerprint
 from fastapi.responses import Response
 
 logger = logging.getLogger(__name__)
@@ -176,13 +178,16 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
     try:
         # Check if AI is available
         if not is_ai_available():
-            return {
-                "status": "error",
-                "scenario_id": scenario_id,
-                "error": "No LLM provider available",
-                "message": "Start Ollama with a model, or set OPENROUTER_API_KEY.",
-                "fallback": "Configure an LLM provider to enable AI analysis.",
-            }
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "status": "error",
+                    "scenario_id": scenario_id,
+                    "error": "No LLM provider available",
+                    "message": "Start Ollama with a model, or set OPENROUTER_API_KEY.",
+                    "fallback": "Configure an LLM provider to enable AI analysis.",
+                },
+            )
 
         # Check scenario exists in database
         cursor = await db.execute("SELECT * FROM scenarios WHERE scenario_id = ?", (scenario_id,))
@@ -205,58 +210,48 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                 policy_records.append(dict(p_row)) if hasattr(p_row, 'keys') else policy_records.append({k: p_row[i] for i, k in enumerate(['policy_id', 'version', 'clause_text', 'effective_date'])})
 
         if not policy_records:
-            return {
-                "status": "error",
-                "scenario_id": scenario_id,
-                "error": "No policies found for this scenario",
-                "message": "Scenario has no configured policies. Run system initialization first.",
-            }
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "status": "error",
+                    "scenario_id": scenario_id,
+                    "error": "No policies found for this scenario",
+                    "message": "Scenario has no configured policies. Run system initialization first.",
+                },
+            )
 
-        # Fetch evidence not yet analyzed by the AI scenario pipeline.
-        # ai_analyzed tracks whether the AI has consumed this evidence,
-        # independent of linked_decision_ids (which may reference a
-        # deterministic Razorpay decision).
-        cursor_ev = await db.execute(
-            "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = FALSE",
+        # ── Step 1: Fetch ALL evidence for this tenant and build the
+        # decision→evidence mapping needed for the idempotency check.
+        # This must run BEFORE the ai_analyzed filter so that the
+        # idempotency check can match decisions whose evidence is
+        # already marked ai_analyzed = TRUE.
+        cursor_all_ev = await db.execute(
+            "SELECT evidence_id, linked_decision_ids FROM evidence WHERE tenant_id = ?",
             (user.tenant_id,),
         )
-        ev_rows = await cursor_ev.fetchall()
-        evidence_records = [dict(r) if hasattr(r, 'keys') else {k: r[i] for i, k in enumerate(['evidence_id', 'tenant_id', 'source_type', 'raw_content', 'extracted_facts', 'linked_decision_ids', 'ai_analyzed', 'content_hash', 'version', 'created_at', 'updated_at'])} for r in ev_rows]
+        all_ev_rows = await cursor_all_ev.fetchall()
+        # Build decision_id → list[evidence_id] mapping
+        dec_to_evidence: dict[str, list[str]] = {}
+        # Also collect every evidence_id in this tenant
+        all_tenant_evidence_ids: list[str] = []
+        for ev_row in all_ev_rows:
+            ev_id = ev_row["evidence_id"] if hasattr(ev_row, "keys") else ev_row[0]
+            all_tenant_evidence_ids.append(ev_id)
+            linked_raw = ev_row["linked_decision_ids"] if hasattr(ev_row, "keys") else ev_row[1]
+            linked_ids = _parse_json_field(linked_raw)
+            if not isinstance(linked_ids, list):
+                linked_ids = []
+            for dec_id in linked_ids:
+                dec_to_evidence.setdefault(dec_id, []).append(ev_id)
 
-        # Parse JSON fields in evidence records
-        for ev in evidence_records:
-            for field in ('extracted_facts', 'linked_decision_ids'):
-                if isinstance(ev.get(field), str):
-                    try:
-                        ev[field] = json.loads(ev[field])
-                    except (json.JSONDecodeError, TypeError):
-                        ev[field] = []
-
-        if not evidence_records:
-            return {
-                "status": "error",
-                "scenario_id": scenario_id,
-                "error": "No evidence available",
-                "message": "No evidence records found for this tenant. Create evidence from Razorpay events or user uploads before running analysis.",
-            }
-
-        # Get previous decision hash from database (not seed data)
-        cursor_hash = await db.execute(
-            "SELECT decision_hash FROM decisions WHERE tenant_id = ? AND decision_id != 'dec_005_tampered' "
-            "ORDER BY created_at DESC LIMIT 1",
-            (user.tenant_id,),
-        )
-        prev_row = await cursor_hash.fetchone()
-        prev_hash = prev_row["decision_hash"] if prev_row else "genesis"
-
-        # Idempotency check: if an AI decision already exists for this
-        # tenant + scenario + evidence set + policy set, return it instead
-        # of creating a duplicate.
-        current_evidence_ids = sorted(ev["evidence_id"] for ev in evidence_records)
+        # ── Step 2: Idempotency check (BEFORE 'No evidence available').
+        # Uses the FULL evidence set so that a second identical run can
+        # match the existing decision even when all evidence is already
+        # ai_analyzed = TRUE.
+        current_evidence_ids = sorted(all_tenant_evidence_ids)
         current_policy_ids = sorted(p["policy_id"] for p in policy_records)
         idempotency_key = (scenario_id, tuple(current_evidence_ids), tuple(current_policy_ids))
 
-        # Find candidate AI decisions for this tenant
         cursor_existing = await db.execute(
             "SELECT decision_id, model_output, policy_version_id FROM decisions "
             "WHERE tenant_id = ? AND approver_id = 'ai_pipeline' "
@@ -264,23 +259,6 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
             (user.tenant_id,),
         )
         existing_rows = await cursor_existing.fetchall()
-
-        # Fetch all evidence for this tenant to resolve linked_decision_ids
-        cursor_all_ev = await db.execute(
-            "SELECT evidence_id, linked_decision_ids FROM evidence WHERE tenant_id = ?",
-            (user.tenant_id,),
-        )
-        all_ev_rows = await cursor_all_ev.fetchall()
-        # Build decision_id -> set(evidence_id) mapping
-        dec_to_evidence: dict[str, list[str]] = {}
-        for ev_row in all_ev_rows:
-            ev_id = ev_row["evidence_id"] if hasattr(ev_row, "keys") else ev_row[0]
-            linked_raw = ev_row["linked_decision_ids"] if hasattr(ev_row, "keys") else ev_row[1]
-            linked_ids = _parse_json_field(linked_raw)
-            if not isinstance(linked_ids, list):
-                linked_ids = []
-            for dec_id in linked_ids:
-                dec_to_evidence.setdefault(dec_id, []).append(ev_id)
 
         for ex_row in existing_rows:
             ex_decision_id = ex_row["decision_id"]
@@ -301,14 +279,37 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                 else None
             )
             ex_key = (ex_scenario_id, tuple(ex_evidence_ids), tuple(ex_policy_ids))
-            if ex_key == idempotency_key:
+
+            # Also verify the analysis_fingerprint if available.
+            # This adds a compact, tamper-evident check on top of the
+            # tuple comparison.
+            ex_fingerprint = (
+                ex_model_output.get("analysis_fingerprint")
+                if isinstance(ex_model_output, dict)
+                else None
+            )
+            expected_fingerprint = (
+                compute_analysis_fingerprint(
+                    tenant_id=user.tenant_id,
+                    scenario_id=scenario_id,
+                    evidence_ids=current_evidence_ids,
+                    policy_ids=list(current_policy_ids),
+                )
+                if current_evidence_ids
+                else None
+            )
+            fingerprint_match = (
+                expected_fingerprint is not None
+                and ex_fingerprint == expected_fingerprint
+            )
+            if ex_key == idempotency_key or fingerprint_match:
                 logger.info(
                     "Reusing existing AI decision %s for scenario %s (idempotent)",
                     ex_decision_id, scenario_id,
                 )
                 cursor_dec = await db.execute(
-                    "SELECT * FROM decisions WHERE decision_id = ?",
-                    (ex_decision_id,),
+                    "SELECT * FROM decisions WHERE decision_id = ? AND tenant_id = ?",
+                    (ex_decision_id, user.tenant_id),
                 )
                 dec_row = await cursor_dec.fetchone()
                 if dec_row:
@@ -323,17 +324,111 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                         "message": f"Existing AI decision {ex_decision_id} already covers this evidence set.",
                     }
 
+        # ── Step 3: No idempotent match found.
+        # Now fetch unanalysed evidence for a new pipeline run.
+        cursor_ev = await db.execute(
+            "SELECT * FROM evidence WHERE tenant_id = ? AND ai_analyzed = FALSE",
+            (user.tenant_id,),
+        )
+        ev_rows = await cursor_ev.fetchall()
+        evidence_records = [dict(r) if hasattr(r, 'keys') else {k: r[i] for i, k in enumerate(['evidence_id', 'tenant_id', 'source_type', 'raw_content', 'extracted_facts', 'linked_decision_ids', 'ai_analyzed', 'content_hash', 'version', 'created_at', 'updated_at'])} for r in ev_rows]
+
+        # Parse JSON fields in evidence records
+        for ev in evidence_records:
+            for field in ('extracted_facts', 'linked_decision_ids'):
+                if isinstance(ev.get(field), str):
+                    try:
+                        ev[field] = json.loads(ev[field])
+                    except (json.JSONDecodeError, TypeError):
+                        ev[field] = []
+
+        if not evidence_records:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "status": "error",
+                    "scenario_id": scenario_id,
+                    "error": "No evidence available",
+                    "message": "No evidence records found for this tenant. Create evidence from Razorpay events or user uploads before running analysis.",
+                },
+            )
+
+        # Get previous decision hash from database (not seed data)
+        cursor_hash = await db.execute(
+            "SELECT decision_hash FROM decisions WHERE tenant_id = ? AND decision_id != 'dec_005_tampered' "
+            "ORDER BY created_at DESC LIMIT 1",
+            (user.tenant_id,),
+        )
+        prev_row = await cursor_hash.fetchone()
+        prev_hash = prev_row["decision_hash"] if prev_row else "genesis"
+
         try:
+            # ── Run the Finance Controller Agent ──
+            # The agent autonomously investigates the case: inspects evidence,
+            # calls bounded tools, detects ambiguity/conflict, and produces
+            # structured analysis.  The deterministic calculation engine
+            # remains the sole authority on monetary amounts.
+            from ai.agent import run_agent
+
+            # Determine gross amount from order evidence for the agent
+            agent_gross = 0
+            for ev in evidence_records:
+                if ev["source_type"] == "order":
+                    try:
+                        content = json.loads(ev["raw_content"])
+                        agent_gross = content.get("amount", 0)
+                        if agent_gross:
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+
+            entity_id = "unknown"
+            for ev in evidence_records:
+                if ev["source_type"] == "order":
+                    try:
+                        content = json.loads(ev["raw_content"])
+                        entity_id = content.get("seller_id") or content.get("razorpay_entity_id", "unknown")
+                        if entity_id != "unknown":
+                            break
+                    except (json.JSONDecodeError, KeyError):
+                        continue
+
+            agent_result = await run_agent(
+                tenant_id=user.tenant_id,
+                scenario_id=scenario_id,
+                entity_id=entity_id,
+                gross_amount=agent_gross,
+                evidence_records=evidence_records,
+                policy_records=policy_records,
+                scenario_description=scenario["description"] if scenario else "",
+            )
+
             result = run_pipeline(
                 scenario_id=scenario_id,
                 evidence_records=evidence_records,
                 policy_records=policy_records,
                 prev_decision_hash=prev_hash,
                 use_mock=False,
+                agent_result=agent_result,
             )
 
             decision = result["decision"]
             decision["tenant_id"] = user.tenant_id
+
+            # Fix the analysis_fingerprint: the pipeline computes it with
+            # tenant_id="" because it doesn't have access to the tenant.
+            # Recompute with the actual tenant_id so idempotency checks
+            # will match.
+            mo = decision.get("model_output", {})
+            if isinstance(mo, dict) and mo.get("analysis_fingerprint"):
+                mo["analysis_fingerprint"] = compute_analysis_fingerprint(
+                    tenant_id=user.tenant_id,
+                    scenario_id=scenario_id,
+                    evidence_ids=sorted(
+                        [ev["evidence_id"] for ev in evidence_records]
+                    ),
+                    policy_ids=sorted(p["policy_id"] for p in policy_records),
+                )
 
             # Persist decision
             await db.execute(
@@ -358,8 +453,8 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
             for ev_result in result["evidence"]:
                 ev_id = ev_result["evidence_id"]
                 cursor = await db.execute(
-                    "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ?",
-                    (ev_id,),
+                    "SELECT linked_decision_ids FROM evidence WHERE evidence_id = ? AND tenant_id = ?",
+                    (ev_id, user.tenant_id),
                 )
                 row = await cursor.fetchone()
                 current_ids = _parse_json_field(
@@ -372,17 +467,18 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                     current_ids.append(new_id)
                 await db.execute(
                     "UPDATE evidence SET extracted_facts = ?, linked_decision_ids = ? "
-                    "WHERE evidence_id = ?",
+                    "WHERE evidence_id = ? AND tenant_id = ?",
                     (
                         json.dumps(ev_result.get("extracted_facts", [])),
                         json.dumps(current_ids),
                         ev_id,
+                        user.tenant_id,
                     ),
                 )
                 # Mark evidence as analyzed by AI so it is not reprocessed.
                 await db.execute(
-                    "UPDATE evidence SET ai_analyzed = TRUE WHERE evidence_id = ?",
-                    (ev_result["evidence_id"],),
+                    "UPDATE evidence SET ai_analyzed = TRUE WHERE evidence_id = ? AND tenant_id = ?",
+                    (ev_result["evidence_id"], user.tenant_id),
                 )
 
             await db.execute(
@@ -405,8 +501,15 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
             }
         except Exception as e:
             logger.error("Pipeline execution failed for %s: %s", scenario_id, str(e))
-            return {"status": "error", "scenario_id": scenario_id, "error": str(e),
-                    "message": "AI pipeline execution failed."}
+            raise HTTPException(
+                status_code=500,
+                detail={
+                    "status": "error",
+                    "scenario_id": scenario_id,
+                    "error": str(e),
+                    "message": "AI pipeline execution failed.",
+                },
+            )
     finally:
         await db.close()
 
@@ -559,7 +662,157 @@ async def verify_decision(decision_id: str, user: CurrentUser = Depends(get_curr
 
         chain.reverse()
         result = verify_chain(chain)
-        return VerificationResult(**result)
+
+        # Extended hash verification
+        canonical_payload = hash_chain.canonicalize(target)
+        recomputed_hash = compute_decision_hash(target, target["prev_decision_hash"])
+        decision_hash_valid = recomputed_hash == target["decision_hash"]
+        prev_hash_valid = (
+            target["prev_decision_hash"] == "genesis"
+            or target["prev_decision_hash"] is not None
+        )
+        chain_continuity = result.get("valid", False)
+
+        return VerificationResult(
+            **result,
+            decision_hash_valid=decision_hash_valid,
+            prev_hash_valid=prev_hash_valid,
+            canonical_payload=canonical_payload,
+            chain_continuity=chain_continuity,
+        )
+    finally:
+        await db.close()
+
+
+@router.get("/decisions/{decision_id}/replay")
+async def replay_decision(decision_id: str, user: CurrentUser = Depends(get_current_user)):
+    """Replay/recompute a stored decision using stored evidence + policies.
+
+    Returns:
+      - stored: the original decision values
+      - recomputed: values from deterministic re-calculation
+      - match: whether stored == recomputed
+      - mismatches: list of fields that differ
+    """
+    from calculations import build_line_items, calculate_final_amount, validate_calculation
+    from hash_chain import compute_decision_hash
+
+    db = await get_db()
+    try:
+        # Fetch the decision
+        cursor = await db.execute(
+            "SELECT * FROM decisions WHERE decision_id = ? AND tenant_id = ?",
+            (decision_id, user.tenant_id),
+        )
+        row = await cursor.fetchone()
+        if not row:
+            raise HTTPException(404, f"Decision {decision_id} not found")
+
+        d = _row_to_decision(row)
+
+        # Fetch linked evidence
+        cursor_ev = await db.execute(
+            "SELECT * FROM evidence WHERE tenant_id = ?",
+            (user.tenant_id,),
+        )
+        ev_rows = await cursor_ev.fetchall()
+        linked_evidence = []
+        for ev in ev_rows:
+            linked_ids = _parse_json_field(ev["linked_decision_ids"])
+            if isinstance(linked_ids, str):
+                linked_ids = [linked_ids]
+            if decision_id in linked_ids:
+                linked_evidence.append(dict(ev))
+
+        # Determine gross amount from linked evidence
+        gross_amount = 0
+        for ev in linked_evidence:
+            if ev["source_type"] == "order":
+                try:
+                    content = json.loads(ev["raw_content"])
+                    gross_amount = content.get("amount", 0)
+                    if gross_amount:
+                        break
+                except (json.JSONDecodeError, KeyError):
+                    continue
+
+        # Fallback: use stored gross_amount if evidence doesn't have it
+        if gross_amount == 0:
+            gross_amount = d["gross_amount"]
+
+        # Rebuild line items from stored line_items (deterministic)
+        stored_items = []
+        for item_data in d.get("line_items", []):
+            if isinstance(item_data, dict):
+                stored_items.append(LineItem(**item_data))
+
+        # Recompute using the deterministic engine
+        evidence_ids_map = {}
+        for item in stored_items:
+            evidence_ids_map[item.label.lower().replace(" ", "_")] = item.evidence_ids
+
+        recomputed_items = build_line_items(
+            gross_amount=gross_amount,
+            has_sla_breach=any(
+                "sla" in (item.policy_clause_id or "") for item in stored_items
+            ),
+            sla_penalty_amount=sum(
+                item.amount for item in stored_items
+                if "sla" in (item.policy_clause_id or "")
+            ),
+            has_returns=any(
+                "return" in (item.policy_clause_id or "") for item in stored_items
+            ),
+            return_reserve_amount=sum(
+                item.amount for item in stored_items
+                if "return" in (item.policy_clause_id or "")
+            ),
+            evidence_ids=evidence_ids_map,
+        )
+        recomputed_final = calculate_final_amount(gross_amount, recomputed_items)
+
+        # Compare stored vs recomputed
+        mismatches = []
+        if d["gross_amount"] != gross_amount:
+            mismatches.append({"field": "gross_amount", "stored": d["gross_amount"], "recomputed": gross_amount})
+        if d["final_amount"] != recomputed_final:
+            mismatches.append({"field": "final_amount", "stored": d["final_amount"], "recomputed": recomputed_final})
+        if len(d.get("line_items", [])) != len(recomputed_items):
+            mismatches.append({
+                "field": "line_items_count",
+                "stored": len(d.get("line_items", [])),
+                "recomputed": len(recomputed_items),
+            })
+
+        # Verify hash integrity
+        canonical_payload = hash_chain.canonicalize(d)
+        recomputed_hash = compute_decision_hash(d, d["prev_decision_hash"])
+        hash_valid = recomputed_hash == d["decision_hash"]
+
+        return {
+            "decision_id": decision_id,
+            "stored": {
+                "gross_amount": d["gross_amount"],
+                "final_amount": d["final_amount"],
+                "line_items": d.get("line_items", []),
+                "policy_version_id": d["policy_version_id"],
+                "decision_hash": d["decision_hash"],
+                "policy_snapshot": (
+                    d.get("model_output", {}).get("policy_snapshot", [])
+                    if isinstance(d.get("model_output", {}), dict)
+                    else []
+                ),
+            },
+            "recomputed": {
+                "gross_amount": gross_amount,
+                "final_amount": recomputed_final,
+                "line_items": [item.model_dump() for item in recomputed_items],
+            },
+            "match": len(mismatches) == 0,
+            "mismatches": mismatches,
+            "hash_valid": hash_valid,
+            "canonical_payload": canonical_payload,
+        }
     finally:
         await db.close()
 
@@ -653,13 +906,35 @@ async def get_defense_packet(decision_id: str, user: CurrentUser = Depends(get_c
                     linked_decision_ids=linked_ids,
                 ))
 
-        # Get relevant policies
-        policy_ids = d["policy_version_id"].split(",")
-        cursor_p = await db.execute("SELECT * FROM policies")
-        pol_rows = await cursor_p.fetchall()
-        relevant_policies = [
-            PolicyResponse(**dict(p)) for p in pol_rows if p["policy_id"] in policy_ids
-        ]
+        # Get relevant policies — prefer stored snapshot for historical reproducibility
+        model_output = d.get("model_output", {})
+        if isinstance(model_output, str):
+            try:
+                model_output = json.loads(model_output)
+            except (json.JSONDecodeError, TypeError):
+                model_output = {}
+        policy_snapshot = model_output.get("policy_snapshot", [])
+
+        if policy_snapshot:
+            # Use stored snapshot — ensures historical decisions are not
+            # affected by future policy updates.
+            relevant_policies = [
+                PolicyResponse(
+                    policy_id=p["policy_id"],
+                    version=p["version"],
+                    clause_text=p["clause_text"],
+                    effective_date=p["effective_date"],
+                )
+                for p in policy_snapshot
+            ]
+        else:
+            # Fallback for legacy decisions created before policy snapshots
+            policy_ids = d["policy_version_id"].split(",")
+            cursor_p = await db.execute("SELECT * FROM policies")
+            pol_rows = await cursor_p.fetchall()
+            relevant_policies = [
+                PolicyResponse(**dict(p)) for p in pol_rows if p["policy_id"] in policy_ids
+            ]
 
         # Verify integrity
         chain = [d]
@@ -694,6 +969,34 @@ async def get_defense_packet(decision_id: str, user: CurrentUser = Depends(get_c
             item.amount for item in parsed_items if item.type in ("fee", "deduction")
         )
 
+        # Extract calculation trace and exceptions from model_output
+        model_output = d.get("model_output", {})
+        if isinstance(model_output, str):
+            try:
+                model_output = json.loads(model_output)
+            except (json.JSONDecodeError, TypeError):
+                model_output = {}
+        calculation_trace = model_output.get("calculation_trace")
+        exceptions = model_output.get("exceptions", [])
+
+        # Extended hash verification
+        canonical_payload = hash_chain.canonicalize(d)
+        recomputed_hash = compute_decision_hash(d, d["prev_decision_hash"])
+        decision_hash_valid = recomputed_hash == d["decision_hash"]
+        prev_hash_valid = (
+            d["prev_decision_hash"] == "genesis"
+            or d["prev_decision_hash"] is not None
+        )
+        chain_continuity = chain_result.get("valid", False)
+
+        integrity = VerificationResult(
+            **chain_result,
+            decision_hash_valid=decision_hash_valid,
+            prev_hash_valid=prev_hash_valid,
+            canonical_payload=canonical_payload,
+            chain_continuity=chain_continuity,
+        )
+
         return DefensePacket(
             decision=_decision_to_response(d),
             financial_breakdown={
@@ -701,12 +1004,14 @@ async def get_defense_packet(decision_id: str, user: CurrentUser = Depends(get_c
                 "total_deductions": total_deductions,
                 "final_amount": d["final_amount"],
                 "validation": validate_calculation(d["gross_amount"], parsed_items, d["final_amount"]),
+                "calculation_trace": calculation_trace,
+                "exceptions": exceptions,
             },
             evidence=linked_evidence,
             policies=relevant_policies,
             approver_id=d["approver_id"],
             approved_at=_to_iso_str(d["approved_at"]),
-            integrity=VerificationResult(**chain_result),
+            integrity=integrity,
         )
     finally:
         await db.close()
@@ -1027,6 +1332,19 @@ async def analyze_decision(
         if req.has_returns:
             applicable_policies.append("returns_3_1")
 
+        # Build immutable policy snapshot for historical reproducibility
+        policy_snapshot = []
+        for pid in applicable_policies:
+            cursor_p = await db.execute("SELECT * FROM policies WHERE policy_id = ?", (pid,))
+            p_row = await cursor_p.fetchone()
+            if p_row:
+                policy_snapshot.append({
+                    "policy_id": p_row["policy_id"],
+                    "version": p_row["version"],
+                    "clause_text": p_row["clause_text"],
+                    "effective_date": p_row["effective_date"],
+                })
+
         claims = []
         if req.has_sla_breach:
             claims.append({"type": "sla_breach", "evidence_ids": evidence_ids, "policy_clause_id": "sla_4_2"})
@@ -1052,6 +1370,7 @@ async def analyze_decision(
                 "extracted_facts_count": sum(
                     len(json.loads(e["extracted_facts"])) for e in []
                 ),
+                "policy_snapshot": policy_snapshot,
             },
             "prev_decision_hash": prev_hash,
             "decision_hash": "",

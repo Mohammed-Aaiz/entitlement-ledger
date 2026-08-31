@@ -69,6 +69,15 @@ class VerificationResult(BaseModel):
     valid: bool
     checked_count: int
     break_at: Optional[str] = None
+    # Extended verification fields (Phase 2)
+    decision_hash_valid: Optional[bool] = None
+    prev_hash_valid: Optional[bool] = None
+    canonical_payload: Optional[str] = None
+    chain_continuity: Optional[bool] = None
+    replay_match: Optional[bool] = None
+    replay_stored_final: Optional[int] = None
+    replay_computed_final: Optional[int] = None
+    replay_mismatches: Optional[list] = None
 
 
 class ScenarioResponse(BaseModel):

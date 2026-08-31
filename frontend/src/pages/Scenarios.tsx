@@ -37,12 +37,14 @@ export default function Scenarios() {
     try {
       const r = await fetch(`/api/scenarios/${id}/run`, { method: 'POST' });
       const d = await r.json();
-      if (d.status === 'completed') {
-        setRuns((p) => ({ ...p, [id]: { status: 'completed', message: d.message, decision_id: d.decision_id } }));
+      // FastAPI HTTPException wraps detail in {detail: {...}}
+      const body = d.detail && typeof d.detail === 'object' ? d.detail : d;
+      if (body.status === 'completed') {
+        setRuns((p) => ({ ...p, [id]: { status: 'completed', message: body.message, decision_id: body.decision_id } }));
         api.getScenarios().then(setScenarios).catch(() => {});
       } else {
         // Detect Ollama connection failure
-        const msg = d.message || d.error || '';
+        const msg = body.message || body.error || '';
         const isOllamaError = msg.toLowerCase().includes('ollama') || msg.toLowerCase().includes('llm') || msg.toLowerCase().includes('model') || msg.toLowerCase().includes('connection');
         setRuns((p) => ({
           ...p,

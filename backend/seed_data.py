@@ -219,6 +219,20 @@ POLICY_RECORDS = [
 ]
 
 
+def _snapshot_for(*policy_ids: str) -> list[dict]:
+    """Build an immutable policy snapshot list for the given policy IDs."""
+    return [
+        {
+            "policy_id": p["policy_id"],
+            "version": p["version"],
+            "clause_text": p["clause_text"],
+            "effective_date": p["effective_date"],
+        }
+        for p in POLICY_RECORDS
+        if p["policy_id"] in policy_ids
+    ]
+
+
 def _build_decision_1() -> dict:
     """Scenario 1: Return + SLA breach — primary scenario."""
     evidence_ids_map = {
@@ -250,7 +264,8 @@ def _build_decision_1() -> dict:
             "claims": [
                 {"type": "sla_breach", "evidence_ids": ["ev_delivery_001"], "policy_clause_id": "sla_4_2"},
                 {"type": "return_processed", "evidence_ids": ["ev_refund_001"], "policy_clause_id": "returns_3_1"},
-            ]
+            ],
+            "policy_snapshot": _snapshot_for("platform_1_1", "sla_4_2", "returns_3_1"),
         },
         "prev_decision_hash": "genesis",
         "decision_hash": "",
@@ -289,7 +304,8 @@ def _build_decision_2() -> dict:
         "model_output": {
             "claims": [
                 {"type": "sla_breach", "evidence_ids": ["ev_delivery_002"], "policy_clause_id": "sla_4_2"},
-            ]
+            ],
+            "policy_snapshot": _snapshot_for("platform_1_1", "sla_4_2"),
         },
         "prev_decision_hash": "genesis",
         "decision_hash": "",
@@ -325,7 +341,8 @@ def _build_decision_3() -> dict:
         "approved_at": _past(2),
         "model_output": {
             "claims": [],
-            "analysis": "Customer complaint was about color mismatch (severity: low). No SLA breach detected. No product return processed. Policy does not support additional deduction for minor complaints resolved with goodwill credit. Recommendation: platform fee only."
+            "analysis": "Customer complaint was about color mismatch (severity: low). No SLA breach detected. No product return processed. Policy does not support additional deduction for minor complaints resolved with goodwill credit. Recommendation: platform fee only.",
+            "policy_snapshot": _snapshot_for("platform_1_1"),
         },
         "prev_decision_hash": "genesis",
         "decision_hash": "",
@@ -361,7 +378,8 @@ def _build_decision_4() -> dict:
         "approved_at": _past(1),
         "model_output": {
             "claims": [],
-            "analysis": "Order completed successfully. No penalties or reserves apply. Standard platform fee deduction."
+            "analysis": "Order completed successfully. No penalties or reserves apply. Standard platform fee deduction.",
+            "policy_snapshot": _snapshot_for("platform_1_1"),
         },
         "prev_decision_hash": "genesis",
         "decision_hash": "",
@@ -403,7 +421,8 @@ def _build_decision_5_tampered() -> dict:
             "claims": [
                 {"type": "sla_breach", "evidence_ids": ["ev_delivery_001"], "policy_clause_id": "sla_4_2"},
                 {"type": "return_processed", "evidence_ids": ["ev_refund_001"], "policy_clause_id": "returns_3_1"},
-            ]
+            ],
+            "policy_snapshot": _snapshot_for("platform_1_1", "sla_4_2", "returns_3_1"),
         },
         "prev_decision_hash": "genesis",
         "decision_hash": "",
