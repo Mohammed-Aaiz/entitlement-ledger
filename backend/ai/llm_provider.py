@@ -367,6 +367,35 @@ class OllamaProvider(LLMProvider):
         logger.info("Ollama complete: %d chars", len(content))
         return content
 
+    def _clean_messages_for_ollama(self, messages: list[dict]) -> list[dict]:
+        """Clean messages for Ollama's API format.
+
+        Ollama does not accept:
+        - tool_calls field in assistant messages (it only returns them)
+        - tool role messages (convert to user with prefix)
+        This cleaning is required for multi-turn tool-calling loops.
+        """
+        clean = []
+        for m in messages:
+            role = m.get("role", "user")
+            content = m.get("content", "") or ""
+
+            if role == "tool":
+                # Ollama doesn't have a 'tool' role — convert to user message
+                name = m.get("name", "unknown")
+                clean.append({
+                    "role": "user",
+                    "content": f"[Tool result: {name}] {content}",
+                })
+            elif role == "assistant" and "tool_calls" in m:
+                # Strip tool_calls — Ollama doesn't accept them as input
+                clean_msg = {"role": "assistant", "content": content}
+                if content:  # Only include assistant if it has content
+                    clean.append(clean_msg)
+            else:
+                clean.append({"role": role, "content": content})
+        return clean
+
     def complete_with_tools(
         self,
         messages: list[dict],
@@ -382,11 +411,13 @@ class OllamaProvider(LLMProvider):
         - Response message may contain tool_calls
         - Parse tool_calls and return as ToolCallResponse
         """
+        # Clean messages — Ollama doesn't accept tool_calls or role="tool"
+        cleaned = self._clean_messages_for_ollama(messages)
         options = {
             "num_predict": max_tokens,
             "temperature": temperature,
         }
-        data = self._ollama_chat(messages, options=options, tools=tools)
+        data = self._ollama_chat(cleaned, options=options, tools=tools)
 
         message = data.get("message", {})
         content = message.get("content")
