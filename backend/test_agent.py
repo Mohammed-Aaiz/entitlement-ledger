@@ -2038,3 +2038,388 @@ class TestNativeToolDefinitions:
         assert len(resp.tool_calls) == 1
         assert resp.tool_calls[0].function_name == "get_order"
         assert resp.tool_calls[0].arguments == {"order_id": "ORD-001"}
+
+
+# ===========================================================================
+# Production idempotency regression tests
+# ===========================================================================
+
+class TestIdempotencyFix:
+    """Reproduces the production bug: evidence consumed (ai_analyzed=TRUE)
+    by a successful AI run, then a second identical run returns
+    'No evidence available' instead of returning the existing decision.
+
+    Verifies the 3-run sequence from the production report plus
+    the late-arrival evidence edge case.
+    """
+
+    def test_idempotent_second_run_returns_existing_decision(self):
+        """FIRST RUN creates decision; SECOND RUN returns it.
+
+        Reproduces:
+          POST /api/scenarios/scenario_1/run  (fresh evidence)
+            → AI decision created, ai_analyzed=TRUE
+          POST /api/scenarios/scenario_1/run  (same evidence)
+            → returns existing decision, NOT 'No evidence available'
+        """
+        import asyncio
+        import json
+        from unittest.mock import patch, MagicMock
+        from main import _ensure_system_config
+        from auth import create_access_token
+        from fastapi.testclient import TestClient
+        from main import app
+        from ai.llm_provider import ToolCallResponse, ToolCallInfo
+        from database import get_db
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(_ensure_system_config())
+        loop.close()
+
+        # ── Insert fresh evidence under a unique scenario ──
+        unique = uuid.uuid4().hex[:8]
+        sid = f"scenario_idem_{unique}"
+        ev_order = f"ev_idem_{unique}_order"
+        ev_delivery = f"ev_idem_{unique}_delivery"
+        order_id = f"ORD-IDEM-{unique}"
+
+        db_loop = asyncio.new_event_loop()
+        db = db_loop.run_until_complete(get_db())
+        try:
+            db_loop.run_until_complete(db.execute(
+                "INSERT OR REPLACE INTO scenarios (scenario_id, name, description, status, policy_ids) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sid, "Idem Test", "Idempotency test", "pending",
+                 json.dumps(["platform_1_1", "sla_4_2"])),
+            ))
+            for eid, etype, content in [
+                (ev_order, "order",
+                 {"order_id": order_id, "seller_id": "seller_idem",
+                  "amount": 100000, "order_date": "2024-11-15"}),
+                (ev_delivery, "delivery",
+                 {"order_id": order_id, "promised_date": "2024-11-20",
+                  "actual_date": "2024-11-25", "delay_days": 5}),
+            ]:
+                db_loop.run_until_complete(db.execute(
+                    "INSERT OR IGNORE INTO evidence "
+                    "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                    "linked_decision_ids, content_hash, version, created_at, ai_analyzed) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)",
+                    (eid, "demo", etype, json.dumps(content), "[]", "[]",
+                     f"h_{eid}", 1, "2024-12-01T00:00:00"),
+                ))
+            db_loop.run_until_complete(db.commit())
+        finally:
+            db_loop.run_until_complete(db.close())
+            db_loop.close()
+
+        # ── Mock LLM provider ──
+        mock_provider = MagicMock()
+        mock_provider.model = "openai/gpt-oss-120b"
+        mock_provider.provider_info.return_value = {"provider": "groq"}
+
+        def _cwt(messages, tools, **kw):
+            return ToolCallResponse(content="done", tool_calls=[], finish_reason="stop")
+
+        def _cc(messages, **kw):
+            return {
+                "claims": [{"claim_type": "sla_breach", "policy_clause_id": "sla_4_2",
+                             "evidence_ids": [ev_delivery], "reasoning": "5 days late"}],
+                "classification": "clear", "confidence": 0.95,
+                "reasoning_summary": "SLA breach.",
+            }
+
+        mock_provider.complete_with_tools = MagicMock(side_effect=_cwt)
+        mock_provider.chat_complete = MagicMock(side_effect=_cc)
+
+        async def _exec(name, tid, args):
+            return {"found": False, "reason": "mock"}
+
+        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
+        client = TestClient(app)
+        patches = [
+            patch("ai.agent.get_provider", return_value=mock_provider),
+            patch("ai.agent.is_ai_available", return_value=True),
+            patch("ai.llm_provider.is_ai_available", return_value=True),
+            patch("ai.agent.execute_tool", new=_exec),
+        ]
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            # ── FIRST RUN: should create a new decision ──
+            resp1 = client.post(
+                f"/api/scenarios/{sid}/run",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp1.status_code == 200, f"First run failed: {resp1.text}"
+        data1 = resp1.json()
+        assert data1["status"] == "completed"
+        dec_id_1 = data1["decision_id"]
+
+        # Verify ai_analyzed was set to TRUE
+        db_loop2 = asyncio.new_event_loop()
+        db2 = db_loop2.run_until_complete(get_db())
+        try:
+            cur = db_loop2.run_until_complete(db2.execute(
+                "SELECT ai_analyzed FROM evidence WHERE evidence_id = ?",
+                (ev_order,)
+            ))
+            row = db_loop2.run_until_complete(cur.fetchone())
+            val = row["ai_analyzed"] if hasattr(row, "keys") else row[0]
+            assert val is True or val == 1, f"ai_analyzed should be TRUE after first run, got {val}"
+        finally:
+            db_loop2.run_until_complete(db2.close())
+            db_loop2.close()
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            # ── SECOND RUN: must return the existing decision ──
+            resp2 = client.post(
+                f"/api/scenarios/{sid}/run",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp2.status_code == 200, f"Second run failed: {resp2.text}"
+        data2 = resp2.json()
+        assert data2["status"] == "completed"
+        assert data2["decision_id"] == dec_id_1, (
+            f"Second run must return same decision, got {data2['decision_id']} != {dec_id_1}"
+        )
+        assert "No evidence available" not in data2.get("message", ""), (
+            f"Must NOT return 'No evidence available', got: {data2.get('message')}"
+        )
+
+    def test_different_scenario_same_evidence_creates_independent_decision(self):
+        """Different scenario with its own evidence → independent decision.
+
+        Each scenario gets its own fresh evidence. Verifies:
+        - scenario_1 and scenario_2 produce different decision IDs
+        - scenario_1 idempotency still works after scenario_2 runs
+        """
+        import asyncio
+        import json
+        from unittest.mock import patch, MagicMock
+        from main import _ensure_system_config
+        from auth import create_access_token
+        from fastapi.testclient import TestClient
+        from main import app
+        from ai.llm_provider import ToolCallResponse
+        from database import get_db
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(_ensure_system_config())
+        loop.close()
+
+        unique = uuid.uuid4().hex[:8]
+        sid1 = f"scenario_diff_a_{unique}"
+        sid2 = f"scenario_diff_b_{unique}"
+        ev1 = f"ev_diff_{unique}_1"
+        ev2 = f"ev_diff_{unique}_2"
+
+        db_loop = asyncio.new_event_loop()
+        db = db_loop.run_until_complete(get_db())
+        try:
+            for s in [sid1, sid2]:
+                db_loop.run_until_complete(db.execute(
+                    "INSERT OR REPLACE INTO scenarios (scenario_id, name, description, status, policy_ids) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (s, f"Diff Test {s}", "test", "pending",
+                     json.dumps(["platform_1_1", "sla_4_2"])),
+                ))
+            # Insert ev1 only — ev2 will be inserted AFTER sid1 runs
+            db_loop.run_until_complete(db.execute(
+                "INSERT OR IGNORE INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, content_hash, version, created_at, ai_analyzed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)",
+                (ev1, "demo", "order",
+                 json.dumps({"order_id": f"ORD-A-{unique}", "seller_id": "s", "amount": 100000}),
+                 "[]", "[]", f"h_{ev1}", 1, "2024-12-01T00:00:00"),
+            ))
+            db_loop.run_until_complete(db.commit())
+        finally:
+            db_loop.run_until_complete(db.close())
+            db_loop.close()
+
+        mock_provider = MagicMock()
+        mock_provider.model = "openai/gpt-oss-120b"
+        mock_provider.provider_info.return_value = {"provider": "groq"}
+
+        def _cwt(messages, tools, **kw):
+            return ToolCallResponse(content="done", tool_calls=[], finish_reason="stop")
+
+        def _cc(messages, **kw):
+            return {
+                "claims": [], "classification": "clear", "confidence": 0.95,
+                "reasoning_summary": "No issues.",
+            }
+
+        mock_provider.complete_with_tools = MagicMock(side_effect=_cwt)
+        mock_provider.chat_complete = MagicMock(side_effect=_cc)
+
+        async def _exec(name, tid, args):
+            return {"found": False}
+
+        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
+        client = TestClient(app)
+        patches = [
+            patch("ai.agent.get_provider", return_value=mock_provider),
+            patch("ai.agent.is_ai_available", return_value=True),
+            patch("ai.llm_provider.is_ai_available", return_value=True),
+            patch("ai.agent.execute_tool", new=_exec),
+        ]
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            resp_a = client.post(
+                f"/api/scenarios/{sid1}/run",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp_a.status_code == 200
+        dec_a = resp_a.json()["decision_id"]
+
+        # Insert ev2 AFTER sid1 consumed ev1 — sid2 gets fresh evidence
+        db_loop2 = asyncio.new_event_loop()
+        db2 = db_loop2.run_until_complete(get_db())
+        try:
+            db_loop2.run_until_complete(db2.execute(
+                "INSERT OR IGNORE INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, content_hash, version, created_at, ai_analyzed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)",
+                (ev2, "demo", "order",
+                 json.dumps({"order_id": f"ORD-B-{unique}", "seller_id": "s", "amount": 80000}),
+                 "[]", "[]", f"h_{ev2}", 1, "2024-12-02T00:00:00"),
+            ))
+            db_loop2.run_until_complete(db2.commit())
+        finally:
+            db_loop2.run_until_complete(db2.close())
+            db_loop2.close()
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            resp_b = client.post(
+                f"/api/scenarios/{sid2}/run",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp_b.status_code == 200, f"sid2 run failed: {resp_b.text}"
+        dec_b = resp_b.json()["decision_id"]
+
+        # Different scenario → different decision
+        assert dec_a != dec_b, "Different scenarios must produce different decisions"
+
+        # Second run of sid1 → still returns dec_a (idempotent)
+        with patches[0], patches[1], patches[2], patches[3]:
+            resp_a2 = client.post(
+                f"/api/scenarios/{sid1}/run",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp_a2.status_code == 200
+        assert resp_a2.json()["decision_id"] == dec_a
+
+    def test_late_arriving_evidence_does_not_break_idempotency(self):
+        """Evidence arriving AFTER the first run must not invalidate
+        the idempotency key for the original completed run."""
+        import asyncio
+        import json
+        from unittest.mock import patch, MagicMock
+        from main import _ensure_system_config
+        from auth import create_access_token
+        from fastapi.testclient import TestClient
+        from main import app
+        from ai.llm_provider import ToolCallResponse
+        from database import get_db
+
+        loop = asyncio.new_event_loop()
+        loop.run_until_complete(_ensure_system_config())
+        loop.close()
+
+        unique = uuid.uuid4().hex[:8]
+        sid = f"scenario_late_{unique}"
+        ev1 = f"ev_late_{unique}_1"
+        ev2 = f"ev_late_{unique}_2"  # arrives later
+        oid = f"ORD-LATE-{unique}"
+
+        db_loop = asyncio.new_event_loop()
+        db = db_loop.run_until_complete(get_db())
+        try:
+            db_loop.run_until_complete(db.execute(
+                "INSERT OR REPLACE INTO scenarios (scenario_id, name, description, status, policy_ids) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sid, "Late Test", "late evidence test", "pending",
+                 json.dumps(["platform_1_1"])),
+            ))
+            # Only ev1 exists initially
+            db_loop.run_until_complete(db.execute(
+                "INSERT OR IGNORE INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, content_hash, version, created_at, ai_analyzed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)",
+                (ev1, "demo", "order",
+                 json.dumps({"order_id": oid, "seller_id": "s", "amount": 50000}),
+                 "[]", "[]", f"h_{ev1}", 1, "2024-12-01T00:00:00"),
+            ))
+            db_loop.run_until_complete(db.commit())
+        finally:
+            db_loop.run_until_complete(db.close())
+            db_loop.close()
+
+        mock_provider = MagicMock()
+        mock_provider.model = "openai/gpt-oss-120b"
+        mock_provider.provider_info.return_value = {"provider": "groq"}
+
+        def _cwt(messages, tools, **kw):
+            return ToolCallResponse(content="done", tool_calls=[], finish_reason="stop")
+
+        def _cc(messages, **kw):
+            return {
+                "claims": [], "classification": "clear", "confidence": 0.98,
+                "reasoning_summary": "No issues.",
+            }
+
+        mock_provider.complete_with_tools = MagicMock(side_effect=_cwt)
+        mock_provider.chat_complete = MagicMock(side_effect=_cc)
+
+        async def _exec(name, tid, args):
+            return {"found": False}
+
+        token = create_access_token("usr_test_admin", "demo", "admin", "test@demo.ledger")
+        client = TestClient(app)
+        patches = [
+            patch("ai.agent.get_provider", return_value=mock_provider),
+            patch("ai.agent.is_ai_available", return_value=True),
+            patch("ai.llm_provider.is_ai_available", return_value=True),
+            patch("ai.agent.execute_tool", new=_exec),
+        ]
+
+        with patches[0], patches[1], patches[2], patches[3]:
+            resp1 = client.post(
+                f"/api/scenarios/{sid}/run",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp1.status_code == 200
+        dec1 = resp1.json()["decision_id"]
+
+        # Now insert late-arriving evidence
+        db_loop2 = asyncio.new_event_loop()
+        db2 = db_loop2.run_until_complete(get_db())
+        try:
+            db_loop2.run_until_complete(db2.execute(
+                "INSERT OR IGNORE INTO evidence "
+                "(evidence_id, tenant_id, source_type, raw_content, extracted_facts, "
+                "linked_decision_ids, content_hash, version, created_at, ai_analyzed) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, FALSE)",
+                (ev2, "demo", "order",
+                 json.dumps({"order_id": oid, "seller_id": "s", "amount": 50000}),
+                 "[]", "[]", f"h_{ev2}", 1, "2024-12-02T00:00:00"),
+            ))
+            db_loop2.run_until_complete(db2.commit())
+        finally:
+            db_loop2.run_until_complete(db2.close())
+            db_loop2.close()
+
+        # Second run: must still return the original decision (not create a new one)
+        with patches[0], patches[1], patches[2], patches[3]:
+            resp2 = client.post(
+                f"/api/scenarios/{sid}/run",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert resp2.status_code == 200
+        assert resp2.json()["decision_id"] == dec1, (
+            "Late-arriving evidence must NOT break idempotency of the original run"
+        )
