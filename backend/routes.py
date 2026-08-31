@@ -245,12 +245,17 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                 dec_to_evidence.setdefault(dec_id, []).append(ev_id)
 
         # ── Step 2: Idempotency check (BEFORE 'No evidence available').
-        # Uses the FULL evidence set so that a second identical run can
-        # match the existing decision even when all evidence is already
-        # ai_analyzed = TRUE.
-        current_evidence_ids = sorted(all_tenant_evidence_ids)
+        # Must return the existing decision even when all evidence has
+        # ai_analyzed = TRUE (already consumed by a prior successful run).
+        #
+        # Matching criteria (all must hold):
+        #   1. Stored scenario_id == requested scenario_id
+        #   2. Stored policy_ids == current scenario policy_ids
+        #   3. Decision's evidence IDs ⊆ current tenant evidence IDs
+        #      (new unrelated evidence arriving later must not break this)
+        #   4. Stored analysis_fingerprint == recomputed fingerprint
+        #      from the decision's own evidence set (tamper-evident)
         current_policy_ids = sorted(p["policy_id"] for p in policy_records)
-        idempotency_key = (scenario_id, tuple(current_evidence_ids), tuple(current_policy_ids))
 
         cursor_existing = await db.execute(
             "SELECT decision_id, model_output, policy_version_id FROM decisions "
@@ -278,31 +283,40 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                 if isinstance(ex_model_output, dict)
                 else None
             )
-            ex_key = (ex_scenario_id, tuple(ex_evidence_ids), tuple(ex_policy_ids))
 
-            # Also verify the analysis_fingerprint if available.
-            # This adds a compact, tamper-evident check on top of the
-            # tuple comparison.
+            # Guard 1: scenario must match
+            if ex_scenario_id != scenario_id:
+                continue
+
+            # Guard 2: policies must match
+            if tuple(ex_policy_ids) != tuple(current_policy_ids):
+                continue
+
+            # Guard 3: decision's evidence must be a subset of (or equal to)
+            # the current tenant evidence — new unrelated evidence arriving
+            # later must NOT invalidate an existing completed run.
+            if not set(ex_evidence_ids).issubset(set(all_tenant_evidence_ids)):
+                continue
+
+            # Guard 4: fingerprint — recompute from the decision's own
+            # evidence set and compare against the stored fingerprint.
+            # This catches any tampering or evidence-set mismatch.
             ex_fingerprint = (
                 ex_model_output.get("analysis_fingerprint")
                 if isinstance(ex_model_output, dict)
                 else None
             )
-            expected_fingerprint = (
+            recomputed_fingerprint = (
                 compute_analysis_fingerprint(
                     tenant_id=user.tenant_id,
                     scenario_id=scenario_id,
-                    evidence_ids=current_evidence_ids,
-                    policy_ids=list(current_policy_ids),
+                    evidence_ids=ex_evidence_ids,
+                    policy_ids=ex_policy_ids,
                 )
-                if current_evidence_ids
+                if ex_evidence_ids
                 else None
             )
-            fingerprint_match = (
-                expected_fingerprint is not None
-                and ex_fingerprint == expected_fingerprint
-            )
-            if ex_key == idempotency_key or fingerprint_match:
+            if ex_fingerprint and ex_fingerprint == recomputed_fingerprint:
                 logger.info(
                     "Reusing existing AI decision %s for scenario %s (idempotent)",
                     ex_decision_id, scenario_id,
