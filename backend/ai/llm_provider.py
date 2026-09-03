@@ -710,13 +710,25 @@ class GeminiProvider(LLMProvider):
                 )
                 return parsed_dict
             except (json.JSONDecodeError, ValueError):
-                # JSON is genuinely malformed (likely truncated) —
-                # return raw text for _parse_json_response() in complete_json().
-                logger.warning(
-                    "Gemini text not valid JSON (likely truncated): "
-                    "first 100 chars: %s",
-                    content[:100],
-                )
+                # json.loads() failed — try the more permissive parser
+                # which handles markdown fences and JSON boundary detection.
+                try:
+                    parsed_dict = _parse_json_response(content)
+                    logger.info(
+                        "Gemini response (text→structured fallback): "
+                        "parsed in %.2fs",
+                        elapsed,
+                    )
+                    return parsed_dict
+                except ValueError:
+                    # JSON is genuinely malformed (likely truncated) —
+                    # return raw text for _parse_json_response() in
+                    # complete_json().
+                    logger.warning(
+                        "Gemini text not valid JSON (likely truncated): "
+                        "first 100 chars: %s",
+                        content[:100],
+                    )
 
         logger.info("Gemini response (text): %d chars in %.2fs", len(content), elapsed)
         return content
@@ -849,6 +861,8 @@ class GeminiProvider(LLMProvider):
         response_schema=None,
     ):
         """Send a multi-turn message list to Gemini."""
+        from google import genai
+
         # Build conversation contents
         contents = []
         system_instruction = None
@@ -944,10 +958,10 @@ class GeminiProvider(LLMProvider):
         if not content:
             raise ValueError("Gemini returned empty text")
 
-        if json_mode and response_schema is not None:
+        if response_schema is not None:
             try:
                 return json.loads(content)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, ValueError):
                 try:
                     return _parse_json_response(content)
                 except ValueError:
