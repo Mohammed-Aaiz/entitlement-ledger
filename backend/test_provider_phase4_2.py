@@ -607,17 +607,22 @@ class TestSafetyGuarantees:
             "extracted_facts": [],
         }
 
-        # Pipeline raises ValueError for invalid policy references
-        # This proves the pipeline catches and rejects invalid references
-        with pytest.raises(ValueError, match="Invalid references"):
-            run_pipeline(
-                scenario_id="sc_invalid",
-                evidence_records=evidence,
-                policy_records=policies,
-                prev_decision_hash="genesis",
-                use_mock=False,
-                agent_result=agent_result,
-            )
+        # Pipeline catches invalid policy references and sets exception
+        # classification instead of crashing — preserves idempotency
+        result = run_pipeline(
+            scenario_id="sc_invalid",
+            evidence_records=evidence,
+            policy_records=policies,
+            prev_decision_hash="genesis",
+            use_mock=False,
+            agent_result=agent_result,
+        )
+        decision = result["decision"]
+        assert decision["status"] == "REVIEW_REQUIRED"
+        model_output = decision["model_output"]
+        assert model_output["classification"] == "exception"
+        # Policy errors don't affect evidence_sufficiency (which is about evidence)
+        assert model_output["evidence_sufficiency"] == "SUFFICIENT"
 
     def test_invalid_tool_args_handled_safely(self):
         """Agent handles invalid tool arguments without crashing."""

@@ -277,6 +277,122 @@ class TestReferenceValidation:
         assert "nonexistent_policy" in errors[0]
 
 
+class TestContradictionDetection:
+    """Regression: _detect_exceptions must use claim_type (not type).
+
+    Previously c.get("type") was used, but claims use the field name
+    claim_type.  This caused contradiction detection to never fire.
+    Also checked for non-existent "sla_met" claim type.
+    """
+
+    def test_detect_exceptions_uses_claim_type_field(self):
+        """Verify contradiction detection reads claim_type, not type."""
+        from ai.pipeline import _detect_exceptions
+
+        evidence_records = [
+            {"source_type": "order", "evidence_id": "ev_001"},
+            {"source_type": "delivery", "evidence_id": "ev_002"},
+        ]
+        validation = {"valid": True}
+
+        # Two claims with overlapping evidence — should detect conflict
+        reasoning_result = {
+            "claims": [
+                {
+                    "claim_type": "sla_breach",
+                    "policy_clause_id": "sla_4_2",
+                    "evidence_ids": ["ev_001"],
+                    "reasoning": "late delivery",
+                },
+                {
+                    "claim_type": "return_processed",
+                    "policy_clause_id": "returns_3_1",
+                    "evidence_ids": ["ev_001"],  # same evidence!
+                    "reasoning": "return processed",
+                },
+            ],
+            "classification": "ambiguous",
+            "confidence": 0.5,
+            "reasoning_summary": "conflicting",
+        }
+
+        exceptions = _detect_exceptions(
+            reasoning_result, evidence_records, validation,
+            gross_amount=100000, line_items=[],
+        )
+        conflict_cats = [e["category"] for e in exceptions]
+        assert "CONFLICTING_EVIDENCE" in conflict_cats, (
+            "Contradiction detection must fire when same evidence supports "
+            "both SLA breach and return_processed claims"
+        )
+
+    def test_no_false_positive_on_different_evidence(self):
+        """SLA breach + return with different evidence is NOT a contradiction."""
+        from ai.pipeline import _detect_exceptions
+
+        evidence_records = [
+            {"source_type": "order", "evidence_id": "ev_001"},
+            {"source_type": "delivery", "evidence_id": "ev_002"},
+            {"source_type": "refund_record", "evidence_id": "ev_003"},
+        ]
+        validation = {"valid": True}
+
+        reasoning_result = {
+            "claims": [
+                {
+                    "claim_type": "sla_breach",
+                    "policy_clause_id": "sla_4_2",
+                    "evidence_ids": ["ev_002"],  # delivery evidence
+                    "reasoning": "late delivery",
+                },
+                {
+                    "claim_type": "return_processed",
+                    "policy_clause_id": "returns_3_1",
+                    "evidence_ids": ["ev_003"],  # refund evidence
+                    "reasoning": "return processed",
+                },
+            ],
+            "classification": "clear",
+            "confidence": 0.9,
+            "reasoning_summary": "both valid",
+        }
+
+        exceptions = _detect_exceptions(
+            reasoning_result, evidence_records, validation,
+            gross_amount=100000, line_items=[],
+        )
+        conflict_cats = [e["category"] for e in exceptions]
+        assert "CONFLICTING_EVIDENCE" not in conflict_cats, (
+            "Different evidence for SLA breach and return is NOT a contradiction"
+        )
+
+    def test_agent_reported_conflicts_detected(self):
+        """Pipeline must also detect agent-reported conflicting_evidence."""
+        from ai.pipeline import _detect_exceptions
+
+        evidence_records = [
+            {"source_type": "order", "evidence_id": "ev_001"},
+        ]
+        validation = {"valid": True}
+
+        reasoning_result = {
+            "claims": [],
+            "classification": "ambiguous",
+            "confidence": 0.4,
+            "reasoning_summary": "conflicting data",
+            "conflicting_evidence": ["ev_001 vs ev_002"],
+        }
+
+        exceptions = _detect_exceptions(
+            reasoning_result, evidence_records, validation,
+            gross_amount=100000, line_items=[],
+        )
+        conflict_cats = [e["category"] for e in exceptions]
+        assert "CONFLICTING_EVIDENCE" in conflict_cats, (
+            "Agent-reported conflicts must be surfaced as exceptions"
+        )
+
+
 class TestAIAvailability:
     """Test AI availability check."""
 
@@ -315,7 +431,8 @@ class TestPipelineWithMock:
         assert decision["decision_id"].startswith("dec_")
         assert decision["gross_amount"] == 100000
         assert decision["final_amount"] == 75000
-        assert decision["status"] == "REVIEW_REQUIRED"
+        # Safe + sufficient + valid calculation → APPROVED via deterministic gate
+        assert decision["status"] == "APPROVED"
         assert len(decision["line_items"]) == 3
         assert decision["decision_hash"] != ""
         assert "claims" in decision["model_output"]

@@ -20,7 +20,7 @@ from models import (
     VerificationResult, ScenarioResponse, DefensePacket, LineItem,
 )
 import hash_chain
-from hash_chain import verify_chain, compute_decision_hash
+from hash_chain import verify_chain, verify_chain_by_links, compute_decision_hash
 from calculations import validate_calculation, build_line_items, calculate_final_amount
 from ai.pipeline import compute_analysis_fingerprint
 from fastapi.responses import Response
@@ -583,16 +583,23 @@ async def list_decisions(
 
 @router.get("/decisions/verify-all", response_model=VerificationResult)
 async def verify_all_decisions(user: CurrentUser = Depends(get_current_user)):
-    """Verify the entire hash chain for this tenant."""
+    """Verify the entire hash chain for this tenant.
+
+    The chain is traversed by following prev_decision_hash cryptographic
+    links — identifying the chain head, then walking backwards to genesis
+    — NOT by ordering on created_at.  Decisions can legitimately share
+    identical timestamps (and timestamp string formats can differ between
+    writers), so chronological ordering is not a safe traversal.
+    """
     db = await get_db()
     try:
         cursor = await db.execute(
-            "SELECT * FROM decisions WHERE tenant_id = ? AND decision_id != 'dec_005_tampered' ORDER BY created_at",
+            "SELECT * FROM decisions WHERE tenant_id = ? AND decision_id != 'dec_005_tampered'",
             (user.tenant_id,),
         )
         rows = await cursor.fetchall()
         decisions = [_row_to_decision(r) for r in rows]
-        result = verify_chain(decisions)
+        result = verify_chain_by_links(decisions)
         return VerificationResult(**result)
     finally:
         await db.close()

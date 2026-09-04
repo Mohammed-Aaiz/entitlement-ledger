@@ -80,8 +80,13 @@ async def _seed_dev_data():
 
     db = await get_db()
     try:
-        # Check if data already seeded
-        cursor = await db.execute("SELECT COUNT(*) as cnt FROM policies")
+        # Check if demo data was already seeded.  This MUST key off the seed
+        # payload itself (the demo decisions), not the policies table —
+        # _ensure_system_config() always inserts those same policies first,
+        # so a policies-based check would make dev seeding skip every time.
+        cursor = await db.execute(
+            "SELECT COUNT(*) as cnt FROM decisions WHERE tenant_id = 'demo' AND decision_id = 'dec_001'"
+        )
         row = await cursor.fetchone()
         if row["cnt"] > 0:
             logger.info("Seed data already present, skipping.")
@@ -298,10 +303,12 @@ async def global_exception_handler(request: Request, exc: Exception):
 from routes import router
 from razorpay_routes import router as razorpay_router
 from auth_routes import router as auth_router
+from reconciliation.routes import router as reconciliation_router
 
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(router, prefix="/api")
 app.include_router(razorpay_router, prefix="/api")
+app.include_router(reconciliation_router, prefix="/api", tags=["reconciliation"])
 
 
 @app.get("/")

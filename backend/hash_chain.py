@@ -73,6 +73,10 @@ def compute_decision_hash(decision_data: dict, prev_hash: str) -> str:
 def verify_chain(decisions: list[dict]) -> dict:
     """Verify the integrity of a chain of decisions.
     
+    The input MUST be pre-ordered as the actual chain (first decision's
+    prev_decision_hash == "genesis", each subsequent decision's
+    prev_decision_hash == previous decision's decision_hash).
+
     Returns:
         {
             valid: bool,
@@ -98,4 +102,149 @@ def verify_chain(decisions: list[dict]) -> dict:
         "valid": True,
         "checked_count": checked,
         "break_at": None,
+    }
+
+
+def verify_chain_by_links(decisions: list[dict]) -> dict:
+    """Verify hash chains by following prev_decision_hash cryptographic links.
+
+    This does NOT depend on created_at ordering (multiple decisions can
+    legitimately share identical timestamps, and timestamp formats can
+    differ across writers).  Instead it:
+
+      1. identifies the chain head(s) — decisions whose own hash is not
+         referenced as any other decision's prev_decision_hash,
+      2. walks each head backwards through prev_decision_hash links to
+         genesis, recomputing every hash,
+      3. reports diagnostics for:
+         - invalid_hash        — stored hash != recomputed hash (tampering)
+         - missing_predecessor — prev_decision_hash not present in the set
+         - duplicate_hash      — two decisions claim the same decision_hash
+         - cycle               — a loop in the link structure
+         - disconnected        — decision not reachable from any chain head
+
+    Returns:
+        {
+            valid: bool,          # True iff every decision verifies and the
+                                  # tenant forms a single connected chain
+            checked_count: int,   # decisions whose hash recomputed correctly
+            break_at: str | None, # decision_id of the first issue found
+            chains: int,          # number of independent chains (heads)
+            heads: list[str],     # head decision_ids (latest in each chain)
+            issues: list[dict],   # [{decision_id, issue, detail}, ...]
+        }
+    """
+    if not decisions:
+        # Nothing to verify — vacuous validity, matching verify_chain([]).
+        return {
+            "valid": True,
+            "checked_count": 0,
+            "break_at": None,
+            "chains": 0,
+            "heads": [],
+            "issues": [],
+        }
+
+    by_hash: dict[str, list[dict]] = {}
+    for decision in decisions:
+        dhash = decision.get("decision_hash")
+        if dhash:
+            by_hash.setdefault(dhash, []).append(decision)
+
+    # Chain heads: decisions whose own hash is never referenced as another
+    # decision's prev_decision_hash.  These are the LATEST decisions.
+    referenced: set[str] = set()
+    for decision in decisions:
+        prev = decision.get("prev_decision_hash") or "genesis"
+        if prev != "genesis":
+            referenced.add(prev)
+    heads = [d for d in decisions if d.get("decision_hash") not in referenced]
+    # Stable, deterministic diagnostic order (newest head first).
+    heads.sort(key=lambda d: str(d.get("created_at") or ""), reverse=True)
+
+    issues: list[dict] = []
+    break_at = None
+    checked = 0
+    global_visited: set[str] = set()
+
+    def _issue(decision_id: str, issue: str, detail: str) -> None:
+        nonlocal break_at
+        issues.append({
+            "decision_id": decision_id,
+            "issue": issue,
+            "detail": detail,
+        })
+        if break_at is None:
+            break_at = decision_id
+
+    for head in heads:
+        current = head
+        path: list[dict] = []
+        path_ids: set[str] = set()
+        while current is not None:
+            did = current["decision_id"]
+            if did in global_visited:
+                # Merged into an already-verified prefix (fork) — that
+                # prefix was checked on an earlier head's walk.
+                break
+            if did in path_ids:
+                _issue(did, "cycle", "decision revisited while walking the chain")
+                break
+            path.append(current)
+            path_ids.add(did)
+
+            prev = current.get("prev_decision_hash") or "genesis"
+            expected = compute_decision_hash(current, prev)
+            if current.get("decision_hash") != expected:
+                _issue(
+                    did, "invalid_hash",
+                    "stored decision_hash does not match recomputed hash (tampering?)",
+                )
+                break
+            checked += 1
+
+            if prev == "genesis":
+                break
+            predecessors = by_hash.get(prev)
+            if not predecessors:
+                _issue(
+                    did, "missing_predecessor",
+                    f"prev_decision_hash {prev[:16]}... not found in tenant decisions",
+                )
+                break
+            if len(predecessors) > 1:
+                _issue(
+                    did, "duplicate_hash",
+                    f"multiple decisions claim decision_hash {prev[:16]}...",
+                )
+                break
+            current = predecessors[0]
+
+        global_visited.update(path_ids)
+
+    # Decisions never reached from any head form disconnected fragments.
+    unreachable = [d for d in decisions if d["decision_id"] not in global_visited]
+    for decision in unreachable:
+        _issue(
+            decision["decision_id"], "disconnected",
+            "decision is not reachable from any chain head",
+        )
+
+    # A healthy tenant ledger is exactly ONE connected chain.  Multiple
+    # heads mean the ledger has forked or been tampered with.
+    valid = not issues and len(heads) == 1
+    if len(heads) != 1:
+        for head in heads[1:]:
+            _issue(
+                head["decision_id"], "disconnected",
+                "additional chain head found — ledger is not a single chain",
+            )
+
+    return {
+        "valid": valid,
+        "checked_count": checked,
+        "break_at": break_at,
+        "chains": len(heads),
+        "heads": [h["decision_id"] for h in heads],
+        "issues": issues,
     }

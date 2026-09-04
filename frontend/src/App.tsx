@@ -16,6 +16,7 @@ import Scenarios from './pages/Scenarios';
 import AnalyzeDecision from './pages/AnalyzeDecision';
 import Decisions from './pages/Decisions';
 import Login from './pages/Login';
+import FinanceControlRoom from './pages/FinanceControlRoom';
 
 /* ─── Navigation items ─── */
 interface NavItem {
@@ -39,6 +40,12 @@ const NAV_SECTIONS: { title: string; items: NavItem[] }[] = [
       { label: 'Audit Trail', href: '/audit', icon: '◈' },
       { label: 'Evidence', href: '/decisions/dec_001/evidence', icon: '◉' },
       { label: 'Defense Packets', href: '/decisions/dec_001/defense', icon: '▣' },
+    ],
+  },
+  {
+    title: 'FINANCE',
+    items: [
+      { label: 'Finance Control Room', href: '/finance-control-room', icon: '◈' },
     ],
   },
   {
@@ -419,6 +426,7 @@ function AppShell() {
               <Route path="/sellers/:entityId" element={<SellerProfile />} />
               <Route path="/scenarios" element={<Scenarios />} />
               <Route path="/razorpay" element={<RazorpayEvents />} />
+              <Route path="/finance-control-room" element={<FinanceControlRoom />} />
             </Routes>
           </div>
         </main>

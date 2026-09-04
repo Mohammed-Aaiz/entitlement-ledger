@@ -1053,7 +1053,10 @@ class GroqProvider(LLMProvider):
     def __init__(self, api_key: str = "", model: str = "openai/gpt-oss-120b"):
         self.api_key = api_key
         self.model = model
-        self.base_url = "https://api.groq.com/openai/v1"
+        self.base_url = os.environ.get(
+            "GROQ_BASE_URL",
+            "https://api.groq.com/openai/v1",
+        ).rstrip("/")
 
     def is_available(self) -> bool:
         return bool(self.api_key)
@@ -1088,11 +1091,13 @@ class GroqProvider(LLMProvider):
 
         if resp.status_code != 200:
             error_body = resp.text[:2000]
-            logger.error(
-                "Groq API error: status=%s body=%s payload=%s",
-                resp.status_code,
-                error_body,
-                payload,
+            print(
+                f"\n=== GROQ HTTP ERROR ===\n"
+                f"STATUS: {resp.status_code}\n"
+                f"BODY: {error_body}\n"
+                f"ROLES: {[m.get('role') for m in payload.get('messages', [])]}\n"
+                f"=== END GROQ ERROR ===\n",
+                flush=True,
             )
             raise ValueError(
                 f"Groq API error {resp.status_code}: {error_body}"
@@ -1147,14 +1152,9 @@ class GroqProvider(LLMProvider):
                 f"Groq returned empty content. finish_reason={finish_reason}"
             )
 
-        usage = data.get("usage", {}) or {}
         logger.info(
-            "Groq chat response: %d chars, finish_reason=%s, prompt_tokens=%s, "
-            "completion_tokens=%s, elapsed=%.2fs",
-            len(content), finish_reason,
-            usage.get("prompt_tokens"),
-            usage.get("completion_tokens"),
-            elapsed,
+            "Groq chat response: %d chars, finish_reason=%s, elapsed=%.2fs",
+            len(content), finish_reason, elapsed,
         )
 
         if response_schema is not None and json_mode:
@@ -1232,15 +1232,11 @@ class GroqProvider(LLMProvider):
                 )
             )
 
-        usage = data.get("usage", {}) or {}
         logger.info(
-            "Groq tool-calling response: content=%s, tool_calls=%d, finish_reason=%s, "
-            "prompt_tokens=%s, completion_tokens=%s, elapsed=%.2fs",
+            "Groq tool-calling response: content=%s, tool_calls=%d, finish_reason=%s, elapsed=%.2fs",
             "present" if content else "None",
             len(parsed_tool_calls),
             finish_reason,
-            usage.get("prompt_tokens"),
-            usage.get("completion_tokens"),
             elapsed,
         )
 

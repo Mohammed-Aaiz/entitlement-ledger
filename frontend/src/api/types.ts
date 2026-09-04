@@ -184,3 +184,101 @@ export interface SellerDecisions {
     verification: VerificationResult;
   }>;
 }
+
+export interface ReconciliationException {
+  code: string;
+  explanation: string;
+  involved_record_ids: string[];
+  financial_impact: number;
+  evidence_refs: string[];
+  human_action_required: boolean;
+}
+
+export interface ReconciliationRecordInput {
+  record_type: 'payment' | 'refund' | 'settlement' | 'fee_tax' | 'adjustment';
+  external_id: string;
+  amount: number;
+  currency?: string;
+  status?: string;
+  payment_id?: string;
+  order_id?: string;
+  fee_amount?: number;
+  tax_amount?: number;
+  adjustment_sign?: 'positive' | 'negative' | '';
+  recorded_at?: string | null;
+  source?: string;
+  raw_evidence_ref?: string;
+  payload_hash?: string;
+  extra?: Record<string, unknown>;
+}
+
+export interface ReconciliationRun {
+  run_id: string;
+  status: string;
+  source: string;
+  total_records: number;
+  total_cases: number;
+  matched: number;
+  review_required: number;
+  exceptions: number;
+  match_rate: number;
+  classification_accuracy: number | null;
+  calculation_accuracy: number | null;
+  false_auto_resolve: number;
+  throughput_per_sec: number;
+  p50_latency_ms: number;
+  p95_latency_ms: number;
+  duplicates_detected: number;
+  audit_completeness: number;
+  errors: string[];
+  started_at: string;
+  completed_at: string;
+}
+
+export interface ReconciliationCase {
+  case_id: string;
+  payment_id: string;
+  run_id: string;
+  classification: 'MATCHED' | 'REVIEW_REQUIRED' | 'EXCEPTION';
+  expected_amount: number;
+  actual_amount: number;
+  variance: number;
+  exception_codes: string[];
+  exceptions: ReconciliationException[];
+  ai_status: string;
+  ai_confidence: number | null;
+  ai_interpretation: Record<string, unknown>;
+  ai_technical_reason: string;
+  calculation_trace: {
+    captured_amount?: number;
+    refund_total?: number;
+    fee_total?: number;
+    tax_total?: number;
+    adjustments?: number;
+    expected_settlement?: number;
+    actual_settlement?: number | null;
+    variance?: number | null;
+    currency?: string;
+    steps?: Array<{ component: string; sign: string; amount: number; running_total: number; label: string }>;
+    formula?: string;
+  };
+  match_info: Record<string, unknown>;
+  decision_id: string;
+  explanation: string;
+  related_record_ids: string[];
+  created_at: string;
+}
+
+export interface ReconciliationDashboard {
+  total_runs: number;
+  latest_run: ReconciliationRun | null;
+  total_cases: number;
+  matched: number;
+  review_required: number;
+  exceptions: number;
+  match_rate: number;
+  total_variance: number;
+  unresolved_exceptions: ReconciliationCase[];
+  false_auto_resolve_risk_cases: ReconciliationCase[];
+  ledger_verified: boolean;
+}

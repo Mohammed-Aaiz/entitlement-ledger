@@ -78,6 +78,11 @@ class VerificationResult(BaseModel):
     replay_stored_final: Optional[int] = None
     replay_computed_final: Optional[int] = None
     replay_mismatches: Optional[list] = None
+    # Link-traversal diagnostics (chain verified by following
+    # prev_decision_hash links, not by created_at ordering)
+    chains: Optional[int] = None
+    heads: Optional[list] = None
+    issues: Optional[list] = None
 
 
 class ScenarioResponse(BaseModel):

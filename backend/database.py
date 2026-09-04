@@ -241,6 +241,87 @@ CREATE TABLE IF NOT EXISTS razorpay_account_mappings (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Normalized financial records for reconciliation (payments, refunds,
+-- settlements, fee/tax, adjustments).  All amounts in integer subunits (paise).
+CREATE TABLE IF NOT EXISTS reconciliation_records (
+    record_id VARCHAR(128) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL REFERENCES tenants(tenant_id),
+    record_type VARCHAR(32) NOT NULL,
+    external_id VARCHAR(256) NOT NULL,
+    amount BIGINT NOT NULL,
+    currency VARCHAR(8) NOT NULL DEFAULT 'INR',
+    status VARCHAR(64) NOT NULL DEFAULT 'unknown',
+    payment_id VARCHAR(128) NOT NULL DEFAULT '',
+    order_id VARCHAR(128) NOT NULL DEFAULT '',
+    fee_amount BIGINT NOT NULL DEFAULT 0,
+    tax_amount BIGINT NOT NULL DEFAULT 0,
+    adjustment_sign VARCHAR(16) NOT NULL DEFAULT '',
+    recorded_at TIMESTAMPTZ,
+    source VARCHAR(32) NOT NULL DEFAULT 'batch',
+    raw_evidence_ref VARCHAR(256) NOT NULL DEFAULT '',
+    payload_hash VARCHAR(128) NOT NULL DEFAULT '',
+    extra JSONB NOT NULL DEFAULT '{}',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_rec_records_tenant ON reconciliation_records(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_rec_records_payment ON reconciliation_records(tenant_id, payment_id);
+CREATE INDEX IF NOT EXISTS idx_rec_records_type ON reconciliation_records(record_type);
+
+-- One reconciliation case per payment (deterministic outcome + audit trail)
+CREATE TABLE IF NOT EXISTS reconciliation_cases (
+    case_id VARCHAR(128) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL REFERENCES tenants(tenant_id),
+    run_id VARCHAR(128) NOT NULL DEFAULT '',
+    payment_id VARCHAR(128) NOT NULL,
+    related_record_ids JSONB NOT NULL DEFAULT '[]',
+    expected_amount BIGINT NOT NULL DEFAULT 0,
+    actual_amount BIGINT NOT NULL DEFAULT 0,
+    variance BIGINT NOT NULL DEFAULT 0,
+    classification VARCHAR(32) NOT NULL DEFAULT 'REVIEW_REQUIRED',
+    exception_codes JSONB NOT NULL DEFAULT '[]',
+    exceptions JSONB NOT NULL DEFAULT '[]',
+    ai_status VARCHAR(32) NOT NULL DEFAULT 'not_needed',
+    ai_confidence DOUBLE PRECISION,
+    ai_interpretation JSONB NOT NULL DEFAULT '{}',
+    ai_technical_reason TEXT NOT NULL DEFAULT '',
+    calculation_trace JSONB NOT NULL DEFAULT '{}',
+    match_info JSONB NOT NULL DEFAULT '{}',
+    decision_id VARCHAR(128) NOT NULL DEFAULT '',
+    explanation TEXT NOT NULL DEFAULT '',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_rec_cases_tenant ON reconciliation_cases(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_rec_cases_run ON reconciliation_cases(tenant_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_rec_cases_class ON reconciliation_cases(classification);
+CREATE INDEX IF NOT EXISTS idx_rec_cases_payment ON reconciliation_cases(tenant_id, payment_id);
+
+-- Batch reconciliation run with real aggregate metrics
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    run_id VARCHAR(128) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL REFERENCES tenants(tenant_id),
+    status VARCHAR(32) NOT NULL DEFAULT 'running',
+    source VARCHAR(32) NOT NULL DEFAULT 'batch',
+    total_records INTEGER NOT NULL DEFAULT 0,
+    total_cases INTEGER NOT NULL DEFAULT 0,
+    matched INTEGER NOT NULL DEFAULT 0,
+    review_required INTEGER NOT NULL DEFAULT 0,
+    exceptions INTEGER NOT NULL DEFAULT 0,
+    match_rate DOUBLE PRECISION NOT NULL DEFAULT 0,
+    classification_accuracy DOUBLE PRECISION,
+    calculation_accuracy DOUBLE PRECISION,
+    false_auto_resolve INTEGER NOT NULL DEFAULT 0,
+    throughput_per_sec DOUBLE PRECISION NOT NULL DEFAULT 0,
+    p50_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+    p95_latency_ms DOUBLE PRECISION NOT NULL DEFAULT 0,
+    duplicates_detected INTEGER NOT NULL DEFAULT 0,
+    audit_completeness DOUBLE PRECISION NOT NULL DEFAULT 0,
+    errors JSONB NOT NULL DEFAULT '[]',
+    started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    completed_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_rec_runs_tenant ON reconciliation_runs(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_rec_runs_status ON reconciliation_runs(status);
 """
 
 # ---------------------------------------------------------------------------
@@ -458,6 +539,90 @@ CREATE TABLE IF NOT EXISTS razorpay_account_mappings (
     updated_at TEXT NOT NULL DEFAULT (datetime('now')),
     FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
 );
+
+-- Normalized financial records for reconciliation (payments, refunds,
+-- settlements, fee/tax, adjustments).  All amounts in integer subunits (paise).
+CREATE TABLE IF NOT EXISTS reconciliation_records (
+    record_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    record_type TEXT NOT NULL,
+    external_id TEXT NOT NULL,
+    amount INTEGER NOT NULL,
+    currency TEXT NOT NULL DEFAULT 'INR',
+    status TEXT NOT NULL DEFAULT 'unknown',
+    payment_id TEXT NOT NULL DEFAULT '',
+    order_id TEXT NOT NULL DEFAULT '',
+    fee_amount INTEGER NOT NULL DEFAULT 0,
+    tax_amount INTEGER NOT NULL DEFAULT 0,
+    adjustment_sign TEXT NOT NULL DEFAULT '',
+    recorded_at TEXT,
+    source TEXT NOT NULL DEFAULT 'batch',
+    raw_evidence_ref TEXT NOT NULL DEFAULT '',
+    payload_hash TEXT NOT NULL DEFAULT '',
+    extra TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rec_records_tenant ON reconciliation_records(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_rec_records_payment ON reconciliation_records(tenant_id, payment_id);
+CREATE INDEX IF NOT EXISTS idx_rec_records_type ON reconciliation_records(record_type);
+
+-- One reconciliation case per payment (deterministic outcome + audit trail)
+CREATE TABLE IF NOT EXISTS reconciliation_cases (
+    case_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    run_id TEXT NOT NULL DEFAULT '',
+    payment_id TEXT NOT NULL,
+    related_record_ids TEXT NOT NULL DEFAULT '[]',
+    expected_amount INTEGER NOT NULL DEFAULT 0,
+    actual_amount INTEGER NOT NULL DEFAULT 0,
+    variance INTEGER NOT NULL DEFAULT 0,
+    classification TEXT NOT NULL DEFAULT 'REVIEW_REQUIRED',
+    exception_codes TEXT NOT NULL DEFAULT '[]',
+    exceptions TEXT NOT NULL DEFAULT '[]',
+    ai_status TEXT NOT NULL DEFAULT 'not_needed',
+    ai_confidence REAL,
+    ai_interpretation TEXT NOT NULL DEFAULT '{}',
+    ai_technical_reason TEXT NOT NULL DEFAULT '',
+    calculation_trace TEXT NOT NULL DEFAULT '{}',
+    match_info TEXT NOT NULL DEFAULT '{}',
+    decision_id TEXT NOT NULL DEFAULT '',
+    explanation TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rec_cases_tenant ON reconciliation_cases(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_rec_cases_run ON reconciliation_cases(tenant_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_rec_cases_class ON reconciliation_cases(classification);
+CREATE INDEX IF NOT EXISTS idx_rec_cases_payment ON reconciliation_cases(tenant_id, payment_id);
+
+-- Batch reconciliation run with real aggregate metrics
+CREATE TABLE IF NOT EXISTS reconciliation_runs (
+    run_id TEXT PRIMARY KEY,
+    tenant_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'running',
+    source TEXT NOT NULL DEFAULT 'batch',
+    total_records INTEGER NOT NULL DEFAULT 0,
+    total_cases INTEGER NOT NULL DEFAULT 0,
+    matched INTEGER NOT NULL DEFAULT 0,
+    review_required INTEGER NOT NULL DEFAULT 0,
+    exceptions INTEGER NOT NULL DEFAULT 0,
+    match_rate REAL NOT NULL DEFAULT 0,
+    classification_accuracy REAL,
+    calculation_accuracy REAL,
+    false_auto_resolve INTEGER NOT NULL DEFAULT 0,
+    throughput_per_sec REAL NOT NULL DEFAULT 0,
+    p50_latency_ms REAL NOT NULL DEFAULT 0,
+    p95_latency_ms REAL NOT NULL DEFAULT 0,
+    duplicates_detected INTEGER NOT NULL DEFAULT 0,
+    audit_completeness REAL NOT NULL DEFAULT 0,
+    errors TEXT NOT NULL DEFAULT '[]',
+    started_at TEXT NOT NULL DEFAULT (datetime('now')),
+    completed_at TEXT,
+    FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)
+);
+CREATE INDEX IF NOT EXISTS idx_rec_runs_tenant ON reconciliation_runs(tenant_id);
+CREATE INDEX IF NOT EXISTS idx_rec_runs_status ON reconciliation_runs(status);
 """
 
 

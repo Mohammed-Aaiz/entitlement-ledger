@@ -15,6 +15,10 @@ import type {
   RazorpaySyncResult,
   SyncedRazorpayRecord,
   SyncHistoryEntry,
+  ReconciliationRun,
+  ReconciliationCase,
+  ReconciliationDashboard,
+  ReconciliationRecordInput,
 } from './types';
 
 const BASE = '/api';
@@ -125,4 +129,22 @@ export const api = {
     fetchJSON<{ syncs: SyncHistoryEntry[] }>('/razorpay/sync/history'),
   getSyncedData: (dataType: 'orders' | 'payments' | 'settlements') =>
     fetchJSON<{ count: number; items: SyncedRazorpayRecord[] }>(`/razorpay/synced/${dataType}`),
+
+  // Reconciliation / Finance Controller
+  runReconciliation: (records: ReconciliationRecordInput[], useAi = false, source = 'batch') =>
+    postJSON<ReconciliationRun>('/reconciliation/run', { records, use_ai: useAi, source }),
+  runDemoReconciliation: (count = 100) =>
+    postJSON<ReconciliationRun>(`/reconciliation/run/demo?count=${count}`, {}),
+  runRazorpayReconciliation: (useAi = false) =>
+    postJSON<ReconciliationRun>(`/reconciliation/run/razorpay?use_ai=${useAi}`, {}),
+  getReconciliationRuns: (limit = 20) =>
+    fetchJSON<{ runs: ReconciliationRun[]; total: number }>(`/reconciliation/runs?limit=${limit}`),
+  getReconciliationRun: (runId: string) =>
+    fetchJSON<ReconciliationRun>(`/reconciliation/runs/${runId}`),
+  getRunExceptions: (runId: string) =>
+    fetchJSON<{ exceptions: ReconciliationCase[]; total: number }>(`/reconciliation/runs/${runId}/exceptions`),
+  getReconciliationCase: (caseId: string) =>
+    fetchJSON<ReconciliationCase>(`/reconciliation/cases/${caseId}`),
+  getReconciliationDashboard: () =>
+    fetchJSON<ReconciliationDashboard>('/reconciliation/dashboard'),
 };
