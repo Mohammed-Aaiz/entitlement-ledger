@@ -1087,7 +1087,13 @@ class GroqProvider(LLMProvider):
             raise ValueError(f"Groq connection error: {e}")
 
         if resp.status_code != 200:
-            error_body = resp.text[:500]
+            error_body = resp.text[:2000]
+            logger.error(
+                "Groq API error: status=%s body=%s payload=%s",
+                resp.status_code,
+                error_body,
+                payload,
+            )
             raise ValueError(
                 f"Groq API error {resp.status_code}: {error_body}"
             )
@@ -1141,9 +1147,14 @@ class GroqProvider(LLMProvider):
                 f"Groq returned empty content. finish_reason={finish_reason}"
             )
 
+        usage = data.get("usage", {}) or {}
         logger.info(
-            "Groq chat response: %d chars, finish_reason=%s, elapsed=%.2fs",
-            len(content), finish_reason, elapsed,
+            "Groq chat response: %d chars, finish_reason=%s, prompt_tokens=%s, "
+            "completion_tokens=%s, elapsed=%.2fs",
+            len(content), finish_reason,
+            usage.get("prompt_tokens"),
+            usage.get("completion_tokens"),
+            elapsed,
         )
 
         if response_schema is not None and json_mode:
@@ -1221,11 +1232,15 @@ class GroqProvider(LLMProvider):
                 )
             )
 
+        usage = data.get("usage", {}) or {}
         logger.info(
-            "Groq tool-calling response: content=%s, tool_calls=%d, finish_reason=%s, elapsed=%.2fs",
+            "Groq tool-calling response: content=%s, tool_calls=%d, finish_reason=%s, "
+            "prompt_tokens=%s, completion_tokens=%s, elapsed=%.2fs",
             "present" if content else "None",
             len(parsed_tool_calls),
             finish_reason,
+            usage.get("prompt_tokens"),
+            usage.get("completion_tokens"),
             elapsed,
         )
 

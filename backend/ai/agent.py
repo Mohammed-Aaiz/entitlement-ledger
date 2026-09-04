@@ -41,8 +41,10 @@ BOUNDED EXECUTION:
 - Hard limits on iterations, tool calls, and duration
 - Never creates infinite tool loops
 """
+import asyncio
 import json
 import logging
+import re
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -53,6 +55,11 @@ from ai.llm_provider import (
 )
 from ai.agent_tools import TOOL_SCHEMAS, execute_tool
 from ai.reasoning import ReasoningSchema
+from ai.failure_taxonomy import (
+    FailureType, classify_provider_error, classify_stop_reason,
+    is_failure, is_success,
+)
+from ai.compact_context import build_compact_analysis_context
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +69,44 @@ logger = logging.getLogger(__name__)
 
 MAX_AGENT_ITERATIONS = 8
 MAX_TOOL_CALLS = 12
-MAX_EXECUTION_DURATION_S = 60
+MAX_EXECUTION_DURATION_S = 120
 MAX_RETRIEVED_EVIDENCE_RECORDS = 20
+MAX_COMPACT_CONTEXT_CHARS = 4000
+
+# Bounded retry for transient rate limits (free-tier Groq TPM/TPD throttling).
+# Retries are capped and never exceed the run's duration budget.
+MAX_RATE_LIMIT_RETRIES = 5
+RATE_LIMIT_RETRY_DEFAULT_S = 10.0
+RATE_LIMIT_RETRY_CAP_S = 90.0
+
+_RATE_LIMIT_RETRY_RE = re.compile(
+    r"try again in\s+(?:(\d+)m\s*)?(\d+(?:\.\d+)?)(ms|s)"
+)
+
+
+def _rate_limit_retry_seconds(
+    error_msg: str,
+    default: float = RATE_LIMIT_RETRY_DEFAULT_S,
+    cap: float = RATE_LIMIT_RETRY_CAP_S,
+) -> float:
+    """Extract the server-suggested retry delay from a provider 429 message.
+
+    Groq's rate-limit bodies use several formats, e.g.
+    "Please try again in 6.4875s", "...in 652.5ms", or "...in 1m30.72s".
+    Falls back to *default* when the delay cannot be parsed, and never
+    waits longer than *cap* so the agent stays within its duration budget.
+    """
+    match = _RATE_LIMIT_RETRY_RE.search(error_msg)
+    if match:
+        try:
+            minutes = float(match.group(1) or 0)
+            value = float(match.group(2))
+            unit = match.group(3)
+            seconds = minutes * 60 + (value / 1000.0 if unit == "ms" else value)
+            return min(seconds, cap)
+        except ValueError:
+            pass
+    return default
 
 # ---------------------------------------------------------------------------
 # Agent system prompt — enforces safety boundaries
@@ -135,7 +178,14 @@ def _build_native_tool_definitions() -> list[dict]:
                 "type": param_type,
                 "description": param_desc,
             }
-            required.append(param_name)
+            # Parameters documented as "optional" (e.g. "string — optional
+            # settlement ID") must NOT be in "required".  Marking them
+            # required makes Groq reject otherwise-valid tool calls with
+            # HTTP 400 tool_use_failed when the model omits an optional
+            # parameter (e.g. get_settlement(order_id=...) with no
+            # settlement_id).
+            if "optional" not in param_desc.lower():
+                required.append(param_name)
 
         tools.append({
             "type": "function",
@@ -175,6 +225,7 @@ class AgentRunState:
 
     def to_dict(self) -> dict:
         """Serialize state for storage in model_output (audit trail)."""
+        failure_type = classify_stop_reason(self.stop_reason)
         return {
             "run_id": self.run_id,
             "decision_id": self.decision_id,
@@ -183,6 +234,7 @@ class AgentRunState:
             "tools_called": self.tools_called,
             "iteration_count": self.iteration_count,
             "stop_reason": self.stop_reason,
+            "failure_type": failure_type.value if is_failure(self.stop_reason) else None,
             "duration_ms": self.duration_ms,
             "model": self.model,
             "provider": self.provider,
@@ -702,18 +754,44 @@ async def run_agent(
             provider = get_provider()
             state.model = getattr(provider, "model", "unknown")
             state.provider = provider.provider_info().get("provider", "unknown")
-            try:
-                tc_response = provider.complete_with_tools(
-                    messages=conversation,
-                    tools=native_tools,
-                    tool_choice="auto",
-                    max_tokens=2048,
-                    temperature=0.0,
-                )
-            except Exception as e:
-                logger.error("Agent LLM call failed: %s", str(e))
-                state.stop_reason = "llm_error"
-                state.success = False
+            # Bounded retry on transient rate limits (free-tier Groq TPM).
+            # Non-rate-limit provider errors fail closed immediately;
+            # rate_limit retries are capped by MAX_RATE_LIMIT_RETRIES.
+            provider_call_failed = False
+            rate_limit_retries = 0
+            while True:
+                try:
+                    tc_response = provider.complete_with_tools(
+                        messages=conversation,
+                        tools=native_tools,
+                        tool_choice="auto",
+                        max_tokens=2048,
+                        temperature=0.0,
+                    )
+                    break
+                except Exception as e:
+                    error_msg = str(e)
+                    failure_type = classify_provider_error(error_msg)
+                    if (
+                        failure_type == FailureType.RATE_LIMIT
+                        and rate_limit_retries < MAX_RATE_LIMIT_RETRIES
+                    ):
+                        rate_limit_retries += 1
+                        wait_s = _rate_limit_retry_seconds(error_msg)
+                        logger.warning(
+                            "Agent run %s rate limited; retrying LLM call in "
+                            "%.1fs (retry %d/%d)",
+                            state.run_id, wait_s,
+                            rate_limit_retries, MAX_RATE_LIMIT_RETRIES,
+                        )
+                        await asyncio.sleep(wait_s)
+                        continue
+                    logger.error("Agent LLM call failed: %s", error_msg)
+                    state.stop_reason = failure_type.value
+                    state.success = False
+                    provider_call_failed = True
+                    break
+            if provider_call_failed:
                 break
 
         # --- Model returned tool calls → execute them ---
@@ -813,12 +891,55 @@ async def run_agent(
         break
 
     # =========================================================================
+    # DETERMINE IF PHASE 2 SHOULD RUN
+    # =========================================================================
+    # Phase 2 should run only when Phase 1 ended normally or hit a limit
+    # (but NOT when a fatal provider error stopped execution).
+    _PHASE1_FATAL = frozenset({"rate_limit", "provider_error", "timeout"})
+    phase1_fatal = state.stop_reason in _PHASE1_FATAL
+
+    # =========================================================================
+    # PHASE 1.5: GEMINI EVIDENCE INTELLIGENCE (conditional)
+    # =========================================================================
+    gemini_evidence = None
+    gemini_needed = False
+    if analysis_result is None and not phase1_fatal and not use_mock:
+        from ai.evidence_intelligence import needs_deep_evidence_analysis, analyze_evidence_with_gemini
+        if needs_deep_evidence_analysis(evidence_records):
+            gemini_needed = True
+            logger.info("Agent run %s: invoking Gemini for deep evidence analysis", state.run_id)
+            try:
+                gemini_evidence = await analyze_evidence_with_gemini(
+                    evidence_records, tenant_id=tenant_id,
+                )
+                state.tools_called.append({
+                    "tool": "gemini_evidence_analysis",
+                    "args": {"record_count": len(evidence_records)},
+                    "result_found": bool(gemini_evidence.facts),
+                    "result_keys": ["facts", "contradictions", "confidence"],
+                    "duration_ms": 0,
+                })
+            except Exception as e:
+                logger.warning("Gemini evidence analysis failed: %s", str(e))
+                gemini_evidence = None
+
+    # =========================================================================
     # PHASE 2: FINAL ANALYSIS (strict JSON schema)
     # =========================================================================
-    if analysis_result is None:
+    if analysis_result is None and not phase1_fatal:
+        # Build compact analysis context — bounded, no raw tool history
+        compact_ctx = build_compact_analysis_context(
+            conversation=conversation,
+            evidence_records=evidence_records,
+            agent_summary=analysis_context,
+        )
+        # Append Gemini evidence findings if available
+        if gemini_evidence and gemini_evidence.facts:
+            compact_ctx += f"\n\nGemini deep analysis ({len(gemini_evidence.facts)} facts):\n"
+            compact_ctx += json.dumps(gemini_evidence.to_dict(), indent=2)[:2000]
         analysis_result = await _run_analysis_phase(
             conversation=conversation,
-            analysis_context=analysis_context,
+            analysis_context=compact_ctx,
             evidence_records=evidence_records,
             state=state,
             use_mock=use_mock,
@@ -867,6 +988,8 @@ async def run_agent(
         "extracted_facts": extracted_facts,
         "evidence_ids_examined": state.evidence_ids_examined,
         "tool_calls": tool_call_count,
+        "gemini_needed": gemini_needed,
+        "gemini_available": gemini_evidence is not None and bool(gemini_evidence.facts),
     }
 
 
@@ -888,6 +1011,7 @@ async def _run_analysis_phase(
     """
     if use_mock:
         state.stop_reason = "analysis_complete"
+        state.success = True
         return _mock_produce_analysis(evidence_records, gross_amount=0)
 
     provider = get_provider()
@@ -926,14 +1050,37 @@ async def _run_analysis_phase(
     })
 
     try:
-        # Use chat_complete with ReasoningSchema for strict structured output
-        parsed = provider.chat_complete(
-            messages=analysis_messages,
-            max_tokens=2048,
-            temperature=0.0,
-            json_mode=True,
-            response_schema=ReasoningSchema,
-        )
+        # Bounded retry on transient rate limits for the final analysis call.
+        # Non-rate-limit failures propagate to the handler below (fail closed).
+        rate_limit_retries = 0
+        while True:
+            try:
+                # Use chat_complete with ReasoningSchema for strict structured output
+                parsed = provider.chat_complete(
+                    messages=analysis_messages,
+                    max_tokens=2048,
+                    temperature=0.0,
+                    json_mode=True,
+                    response_schema=ReasoningSchema,
+                )
+                break
+            except Exception as e:
+                error_msg = str(e)
+                failure_type = classify_provider_error(error_msg)
+                if (
+                    failure_type == FailureType.RATE_LIMIT
+                    and rate_limit_retries < MAX_RATE_LIMIT_RETRIES
+                ):
+                    rate_limit_retries += 1
+                    wait_s = _rate_limit_retry_seconds(error_msg)
+                    logger.warning(
+                        "Analysis phase rate limited; retrying in %.1fs "
+                        "(retry %d/%d)",
+                        wait_s, rate_limit_retries, MAX_RATE_LIMIT_RETRIES,
+                    )
+                    await asyncio.sleep(wait_s)
+                    continue
+                raise
 
         if isinstance(parsed, dict):
             analysis_result = parsed
@@ -951,6 +1098,7 @@ async def _run_analysis_phase(
         analysis_result.setdefault("conflicting_evidence", [])
 
         state.stop_reason = "analysis_complete"
+        state.success = True  # Explicitly restore — analysis completed successfully
 
         # Check for prompt injection in reasoning
         reasoning = analysis_result.get("reasoning_summary", "")

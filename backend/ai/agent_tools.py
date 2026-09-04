@@ -420,7 +420,7 @@ async def tool_search_evidence(tenant_id: str, source_type: str) -> dict:
                     if key in content:
                         summary[key] = content[key]
                 if "amount" in content:
-                    summary["amount"] = content[key]
+                    summary["amount"] = content["amount"]
                 results.append(summary)
             except (json.JSONDecodeError, KeyError):
                 results.append({"evidence_id": ev["evidence_id"], "source_type": ev["source_type"]})
