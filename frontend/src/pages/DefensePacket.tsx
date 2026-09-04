@@ -7,12 +7,12 @@ import BorderGlow from '../components/react-bits/BorderGlow';
 import { SkeletonCard } from '../App';
 
 const SRC_COLORS: Record<string, string> = {
-  order: 'bg-sky-400/10 text-sky-300 border border-sky-400/20',
-  delivery: 'bg-[#7CA5D4]/10 text-[#7CA5D4] border border-[#7CA5D4]/20',
-  complaint: 'bg-red-500/10 text-red-600 border border-red-200',
-  policy_doc: 'bg-purple-600/10 text-purple-600 border border-purple-500/20',
-  seller_agreement: 'bg-emerald-500/10 text-emerald-600 border border-emerald-200',
-  refund_record: 'bg-purple-400/10 text-purple-300 border border-purple-400/20',
+  order: 'bg-sky-500/10 text-sky-700 border border-sky-200',
+  delivery: 'bg-blue-500/10 text-blue-700 border border-blue-200',
+  complaint: 'bg-red-500/10 text-red-700 border border-red-200',
+  policy_doc: 'bg-violet-500/10 text-violet-700 border border-violet-200',
+  seller_agreement: 'bg-emerald-500/10 text-emerald-700 border border-emerald-200',
+  refund_record: 'bg-purple-500/10 text-purple-700 border border-purple-200',
 };
 const chip = (t: string) => `inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${SRC_COLORS[t] || 'bg-white/60 text-stone-600 border border-[var(--border)]'}`;
 
@@ -132,19 +132,19 @@ export default function DefensePacket() {
         <div className="grid gap-4 p-5 sm:grid-cols-4">
           <div>
             <p className="section-label">Seller</p>
-            <Link to={`/sellers/${decision.entity_id}`} className="mt-0.5 block truncate text-sm font-semibold text-purple-600 font-mono hover:underline">{decision.entity_id}</Link>
+            <Link to={`/sellers/${decision.entity_id}`} className="mt-0.5 block truncate text-sm font-semibold text-purple-300 font-mono hover:text-purple-200 hover:underline">{decision.entity_id}</Link>
           </div>
           <div>
             <p className="section-label">Approver</p>
-            <p className="mt-0.5 text-sm font-semibold text-stone-800">{decision.approver_id}</p>
+            <p className="mt-0.5 text-sm font-semibold text-stone-100">{decision.approver_id}</p>
           </div>
           <div>
             <p className="section-label">Approved</p>
-            <p className="amount mt-0.5 text-sm font-semibold text-stone-800">{formatDateTime(decision.approved_at)}</p>
+            <p className="amount mt-0.5 text-sm font-semibold text-stone-100">{formatDateTime(decision.approved_at)}</p>
           </div>
           <div>
             <p className="section-label">Calculation</p>
-            <p className={`mt-0.5 text-sm font-semibold ${validationOk ? 'text-emerald-600' : 'text-red-600'}`}>
+            <p className={`mt-0.5 text-sm font-semibold ${validationOk ? 'text-[#4ADE80]' : 'text-[#F87171]'}`}>
               {validationOk ? '✓ Gross − deductions = final' : '⚠ Mismatch'}
             </p>
           </div>

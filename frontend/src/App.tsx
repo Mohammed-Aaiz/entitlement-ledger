@@ -1,5 +1,10 @@
 import { BrowserRouter, Routes, Route, Link, useNavigate, useLocation, Navigate } from 'react-router-dom';
 import { useEffect, useState, useCallback, useRef } from 'react';
+import {
+  GoBeaker, GoCreditCard, GoFile, GoGitBranch, GoGraph, GoHome,
+  GoListUnordered, GoOrganization, GoPlus, GoSearch, GoShieldLock,
+} from 'react-icons/go';
+import type { IconType } from 'react-icons';
 import { api } from './api/client';
 import type { AIStatus, Decision } from './api/types';
 import { AuthProvider, useAuth } from './auth/AuthContext';
@@ -22,38 +27,38 @@ import FinanceControlRoom from './pages/FinanceControlRoom';
 interface NavItem {
   label: string;
   href: string;
-  icon: string;
+  icon: IconType;
 }
 
 const NAV_SECTIONS: { title: string; items: NavItem[] }[] = [
   {
     title: 'OVERVIEW',
     items: [
-      { label: 'Home', href: '/', icon: '◻' },
-      { label: 'Decisions', href: '/decisions', icon: '◇' },
-      { label: 'New Decision', href: '/analyze', icon: '+' },
+      { label: 'Home', href: '/', icon: GoHome },
+      { label: 'Decisions', href: '/decisions', icon: GoListUnordered },
+      { label: 'New Decision', href: '/analyze', icon: GoPlus },
     ],
   },
   {
     title: 'AUDIT',
     items: [
-      { label: 'Audit Trail', href: '/audit', icon: '◈' },
-      { label: 'Evidence', href: '/decisions/dec_001/evidence', icon: '◉' },
-      { label: 'Defense Packets', href: '/decisions/dec_001/defense', icon: '▣' },
+      { label: 'Audit Trail', href: '/audit', icon: GoGitBranch },
+      { label: 'Evidence', href: '/decisions/dec_001/evidence', icon: GoFile },
+      { label: 'Defense Packets', href: '/decisions/dec_001/defense', icon: GoShieldLock },
     ],
   },
   {
     title: 'FINANCE',
     items: [
-      { label: 'Finance Control Room', href: '/finance-control-room', icon: '◈' },
+      { label: 'Finance Control Room', href: '/finance-control-room', icon: GoGraph },
     ],
   },
   {
     title: 'OPERATIONS',
     items: [
-      { label: 'Sellers', href: '/sellers/seller_abc', icon: '◎' },
-      { label: 'Scenario Lab', href: '/scenarios', icon: '▶' },
-      { label: 'Razorpay Events', href: '/razorpay', icon: '◐' },
+      { label: 'Sellers', href: '/sellers/seller_abc', icon: GoOrganization },
+      { label: 'Scenario Lab', href: '/scenarios', icon: GoBeaker },
+      { label: 'Razorpay Events', href: '/razorpay', icon: GoCreditCard },
     ],
   },
 ];
@@ -169,6 +174,7 @@ function GlobalSearch() {
 
   return (
     <div className="relative">
+      <GoSearch aria-hidden="true" className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-[13px] text-stone-400" />
       <input
         ref={inputRef}
         type="text"
@@ -177,7 +183,7 @@ function GlobalSearch() {
         onFocus={() => setOpen(true)}
         placeholder="Jump to decision…"
         aria-label="Search decisions"
-        className="w-48 rounded-full border border-[var(--border)] bg-white/60 backdrop-blur-md px-3 py-1.5 text-[12px] text-stone-800 placeholder:text-stone-400 shadow-sm focus:border-purple-400/50 focus:outline-none sm:w-64 btn-smooth"
+        className="w-48 rounded-full border border-[var(--border)] bg-white/60 pl-8 pr-10 py-1.5 text-[12px] text-stone-800 placeholder:text-stone-400 shadow-sm focus:border-purple-400/50 focus:outline-none sm:w-64 btn-smooth"
       />
       <kbd className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 rounded border border-[var(--border)] bg-white/50 px-1.5 py-0.5 text-[9px] text-stone-500">⌘K</kbd>
 
@@ -274,24 +280,29 @@ function NavDrawer({ open, onClose }: { open: boolean; onClose: () => void }) {
                         key={item.href}
                         to={item.href}
                         onClick={onClose}
-                        className={`flex items-center gap-3 rounded-xl px-3 py-2 text-sm font-medium transition-all ${
+                        className={`group flex items-center gap-3 rounded-xl px-3 py-2 text-sm font-medium transition-all ${
                           active
-                            ? 'bg-purple-50 text-purple-700'
-                            : 'text-stone-600 hover:bg-stone-50 hover:text-stone-900'
+                            ? 'bg-gradient-to-r from-fuchsia-500/[0.08] to-violet-500/[0.06] text-violet-800 ring-1 ring-violet-500/15'
+                            : 'text-stone-600 hover:bg-black/[0.03] hover:text-stone-900'
                         }`}
                       >
-                        <span className={`text-[12px] ${active ? 'opacity-100 text-purple-500' : 'opacity-40'}`}>
-                          {item.icon}
-                        </span>
+                        <item.icon aria-hidden="true" className={`text-[15px] transition-colors ${active ? 'text-violet-600' : 'text-stone-400 group-hover:text-stone-600'}`} />
                         {item.label}
+                        {active && <span aria-hidden="true" className="ml-auto h-1.5 w-1.5 rounded-full bg-gradient-to-r from-fuchsia-500 to-violet-500" />}
                       </Link>
                     );
                   })}
                 </div>
               ))}
             </nav>
-            <div className="mt-2 border-t border-stone-200/50 pt-2 px-3 pb-1">
-              <p className="text-[10px] text-stone-400">v0.1.0 · Decision provenance</p>
+            <div className="mt-2 border-t border-black/[0.06] px-3 pb-2 pt-2.5">
+              <div className="flex items-center justify-between">
+                <span className="text-[10px] text-stone-400">EntitlementLedger v0.2.0</span>
+                <span className="inline-flex items-center gap-1 text-[9px] font-medium text-stone-400">
+                  <span className="h-1 w-1 rounded-full bg-emerald-500" />
+                  Decision provenance
+                </span>
+              </div>
             </div>
           </div>
         </div>
@@ -394,16 +405,22 @@ function AppShell() {
 
             {/* Right: User Menu */}
             <div className="flex items-center gap-3 pointer-events-auto">
-              <div className="flex items-center gap-2 rounded-full border border-white/20 bg-white/70 px-3 py-1.5 shadow-sm backdrop-blur-xl">
-                <span className="hidden text-[11px] font-medium text-stone-600 sm:block">{user.display_name}</span>
-                <span className="rounded bg-stone-100 px-1.5 py-0.5 text-[9px] font-bold tracking-wider text-stone-500">
+              <div className="flex items-center gap-2.5 rounded-full border border-white/20 bg-white/70 py-1 pl-1 pr-3 shadow-sm backdrop-blur-xl">
+                <span
+                  aria-hidden="true"
+                  className="flex h-7 w-7 items-center justify-center rounded-full bg-gradient-to-br from-fuchsia-500 to-violet-600 text-[10px] font-bold text-white shadow-sm"
+                >
+                  {(user.display_name || user.email || '?').slice(0, 2).toUpperCase()}
+                </span>
+                <span className="hidden text-[11px] font-medium text-stone-700 sm:block">{user.display_name}</span>
+                <span className="rounded-md bg-stone-100 px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider text-stone-500">
                   {user.role}
                 </span>
-                <div className="h-3 w-px bg-stone-300 mx-1"></div>
+                <div className="mx-0.5 h-3 w-px bg-stone-300" />
                 <button
                   type="button"
                   onClick={logout}
-                  className="text-[11px] font-medium text-stone-500 hover:text-red-500 transition-colors"
+                  className="text-[11px] font-medium text-stone-500 transition-colors hover:text-red-600"
                 >
                   Logout
                 </button>

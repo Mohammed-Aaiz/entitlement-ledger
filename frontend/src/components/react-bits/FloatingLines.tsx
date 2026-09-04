@@ -130,8 +130,11 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     mouseUv.y *= -1.0;
   }
 
+  // Constant-bounded loops (guarded by uniform counts) so the shader compiles
+  // reliably on every WebGL2 implementation, including software rasterizers.
   if (enableBottom) {
-    for (int i = 0; i < bottomLineCount; ++i) {
+    for (int i = 0; i < 8; ++i) {
+      if (i >= bottomLineCount) break;
       float fi = float(i);
       float t = fi / max(float(bottomLineCount - 1), 1.0);
       vec3 lineCol = getLineColor(t, b);
@@ -147,7 +150,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     }
   }
   if (enableMiddle) {
-    for (int i = 0; i < middleLineCount; ++i) {
+    for (int i = 0; i < 8; ++i) {
+      if (i >= middleLineCount) break;
       float fi = float(i);
       float t = fi / max(float(middleLineCount - 1), 1.0);
       vec3 lineCol = getLineColor(t, b);
@@ -163,7 +167,8 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
     }
   }
   if (enableTop) {
-    for (int i = 0; i < topLineCount; ++i) {
+    for (int i = 0; i < 8; ++i) {
+      if (i >= topLineCount) break;
       float fi = float(i);
       float t = fi / max(float(topLineCount - 1), 1.0);
       vec3 lineCol = getLineColor(t, b);
@@ -185,7 +190,22 @@ void mainImage(out vec4 fragColor, in vec2 fragCoord) {
 void main() {
   vec4 color = vec4(0.0);
   mainImage(color, gl_FragCoord.xy);
-  gl_FragColor = color;
+  // Transparent background: draw only the line strokes so the shader floats
+  // over the light interface. Colors were tuned for an opaque black backdrop,
+  // so here we renormalize and gate by an exponential alpha curve to keep the
+  // strokes vivid on white while preserving their smooth soft falloff.
+  float magnitude = max(color.r, max(color.g, color.b));
+  // The wave field has a broad soft falloff tuned for an opaque dark backdrop.
+  // On the light interface we gate aggressively and soften the stroke color so
+  // the lines read as elegant translucent ribbons rather than a dense wash.
+  float alpha = smoothstep(0.24, 0.95, magnitude);
+  if (alpha > 0.003) {
+    vec3 chroma = color.rgb / max(magnitude, 1e-5);
+    chroma = mix(vec3(1.0), chroma, 0.58);
+    gl_FragColor = vec4(chroma * alpha, alpha);
+  } else {
+    gl_FragColor = vec4(0.0, 0.0, 0.0, 0.0);
+  }
 }
 `;
 
@@ -250,7 +270,7 @@ export default function FloatingLines({
   mouseDamping = 0.05,
   parallax = true,
   parallaxStrength = 0.2,
-  mixBlendMode = 'screen'
+  mixBlendMode = 'normal'
 }: FloatingLinesProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const targetMouseRef = useRef(new Vector2(-1000, -1000));
@@ -296,7 +316,8 @@ export default function FloatingLines({
     const camera = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
     camera.position.z = 1;
 
-    const renderer = new WebGLRenderer({ antialias: true, alpha: false });
+    const renderer = new WebGLRenderer({ antialias: true, alpha: true, premultipliedAlpha: false });
+    renderer.setClearColor(0x000000, 0);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.domElement.style.width = '100%';
     renderer.domElement.style.height = '100%';
@@ -454,11 +475,24 @@ export default function FloatingLines({
       renderer.render(scene, camera);
       raf = requestAnimationFrame(renderLoop);
     };
+
+    // Pause the GPU loop while the tab is hidden to keep background cost ~0.
+    const onVisibility = () => {
+      if (document.hidden) {
+        cancelAnimationFrame(raf);
+        raf = 0;
+      } else if (active && raf === 0) {
+        lastTime = clock.getElapsedTime();
+        renderLoop();
+      }
+    };
+    document.addEventListener('visibilitychange', onVisibility);
     renderLoop();
 
     return () => {
       active = false;
       cancelAnimationFrame(raf);
+      document.removeEventListener('visibilitychange', onVisibility);
       if (ro) ro.disconnect();
       if (interactive) {
         renderer.domElement.removeEventListener('pointermove', handlePointerMove);

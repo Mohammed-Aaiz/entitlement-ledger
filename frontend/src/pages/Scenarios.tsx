@@ -17,9 +17,9 @@ const SCENARIO_META: Record<string, { purpose: string; gross: string; deductions
 };
 
 const STATUS_COLORS: Record<string, string> = {
-  completed: 'border-[#4ADE80]/30 bg-emerald-500/8 text-emerald-600',
-  pending: 'border-white/[0.12] bg-white/60 text-stone-600',
-  failed: 'border-red-200 bg-red-500/8 text-red-600',
+  completed: 'border-[#4ADE80]/35 bg-[#4ADE80]/10 text-[#4ADE80]',
+  pending: 'border-white/10 bg-white/[0.06] text-stone-200',
+  failed: 'border-[#F87171]/35 bg-[#F87171]/10 text-[#F87171]',
 };
 
 export default function Scenarios() {
@@ -114,30 +114,30 @@ export default function Scenarios() {
             >
               <div className="p-5 h-full flex flex-col">
                 <div className="flex items-start justify-between gap-3">
-                  <h2 className="text-sm font-semibold text-stone-800 leading-snug">{s.name}</h2>
+                  <h2 className="text-sm font-semibold text-stone-100 leading-snug">{s.name}</h2>
                   <span className={`shrink-0 inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[10px] font-medium uppercase tracking-wide ${STATUS_COLORS[st] || STATUS_COLORS.pending}`}>
                     {st}
                   </span>
                 </div>
-                <p className="text-xs text-stone-600 mt-2 leading-relaxed flex-1">{meta.purpose}</p>
+                <p className="text-xs text-stone-300/90 mt-2 leading-relaxed flex-1">{meta.purpose}</p>
 
                 {/* Stats */}
-                <div className="mt-3 flex flex-wrap gap-2 text-[10px] text-stone-500">
-                  <span className="rounded border border-[var(--border)] bg-white/50 px-1.5 py-0.5 amount">Gross {meta.gross}</span>
-                  <span className="rounded border border-[var(--border)] bg-white/50 px-1.5 py-0.5">{meta.deductions} deductions</span>
-                  <span className="rounded border border-[var(--border)] bg-white/50 px-1.5 py-0.5">{meta.evidence} evidence sources</span>
+                <div className="mt-3 flex flex-wrap gap-2 text-[10px] text-stone-300">
+                  <span className="rounded border border-white/10 bg-white/[0.06] px-1.5 py-0.5 amount">Gross {meta.gross}</span>
+                  <span className="rounded border border-white/10 bg-white/[0.06] px-1.5 py-0.5">{meta.deductions} deductions</span>
+                  <span className="rounded border border-white/10 bg-white/[0.06] px-1.5 py-0.5">{meta.evidence} evidence sources</span>
                 </div>
 
                 {/* Run result */}
                 {run?.status === 'completed' && (
-                  <div className="mt-3 rounded-md border border-[#4ADE80]/25 bg-emerald-500/[0.04] px-3 py-2">
-                    <p className="text-[11px] text-emerald-600">✓ Decision created</p>
-                    {run.decision_id && <Link to={`/decisions/${run.decision_id}`} className="text-[11px] font-mono text-purple-600 hover:underline">{run.decision_id}</Link>}
+                  <div className="mt-3 rounded-md border border-[#4ADE80]/30 bg-[#4ADE80]/[0.08] px-3 py-2">
+                    <p className="text-[11px] text-[#4ADE80]">✓ Decision created</p>
+                    {run.decision_id && <Link to={`/decisions/${run.decision_id}`} className="text-[11px] font-mono text-purple-300 hover:text-purple-200 hover:underline">{run.decision_id}</Link>}
                   </div>
                 )}
                 {run?.status === 'error' && (
-                  <div className="mt-3 rounded-md border border-[#F87171]/25 bg-red-500/[0.04] px-3 py-2">
-                    <p className="text-[11px] text-red-600">✗ {run.message}</p>
+                  <div className="mt-3 rounded-md border border-[#F87171]/30 bg-[#F87171]/[0.08] px-3 py-2">
+                    <p className="text-[11px] text-[#F87171]">✗ {run.message}</p>
                   </div>
                 )}
 

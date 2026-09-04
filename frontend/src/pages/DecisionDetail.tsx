@@ -6,12 +6,12 @@ import { formatINR, formatDateTime, sourceTypeLabel } from '../lib/format';
 import BorderGlow from '../components/react-bits/BorderGlow';
 
 const SRC_COLORS: Record<string, string> = {
-  order: 'bg-sky-400/10 text-sky-300 border border-sky-400/20',
-  delivery: 'bg-[#7CA5D4]/10 text-[#7CA5D4] border border-[#7CA5D4]/20',
-  complaint: 'bg-red-500/10 text-red-600 border border-red-200',
-  policy_doc: 'bg-purple-600/10 text-purple-600 border border-purple-500/20',
-  seller_agreement: 'bg-emerald-500/10 text-emerald-600 border border-emerald-200',
-  refund_record: 'bg-purple-400/10 text-purple-300 border border-purple-400/20',
+  order: 'bg-sky-500/10 text-sky-700 border border-sky-200',
+  delivery: 'bg-blue-500/10 text-blue-700 border border-blue-200',
+  complaint: 'bg-red-500/10 text-red-700 border border-red-200',
+  policy_doc: 'bg-violet-500/10 text-violet-700 border border-violet-200',
+  seller_agreement: 'bg-emerald-500/10 text-emerald-700 border border-emerald-200',
+  refund_record: 'bg-purple-500/10 text-purple-700 border border-purple-200',
 };
 const chip = (t: string) =>
   `inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-medium ${SRC_COLORS[t] || 'bg-white/60 text-stone-600 border border-[var(--border)]'}`;
@@ -56,7 +56,7 @@ function ProvenanceChain({ verified, breakAt }: { verified: boolean; breakAt?: s
             <p className="mt-0.5 text-[10px] text-stone-500">{n.sub}</p>
           </div>
           {i < nodes.length - 1 && (
-            <div className="h-4 w-px bg-gradient-to-b from-white/[0.12] to-white/[0.04]" />
+            <div className="h-4 w-px bg-gradient-to-b from-black/[0.12] to-black/[0.04]" />
           )}
         </div>
       ))}
@@ -87,7 +87,7 @@ function IntegrityPanel({ verification, decision }: { verification: Verification
       <div className="p-5">
         <h3
           className={`text-xs font-semibold uppercase tracking-[0.14em] ${
-            verification.valid ? 'text-emerald-600' : 'text-red-600'
+            verification.valid ? 'text-[#4ADE80]' : 'text-[#F87171]'
           }`}
         >
           {verification.valid ? '✓ Integrity Verified' : '✗ Integrity Compromised'}
@@ -95,24 +95,24 @@ function IntegrityPanel({ verification, decision }: { verification: Verification
         <ul className="mt-3 space-y-2">
           {checks.map((c) => (
             <li key={c.label} className="flex items-center gap-2 text-[11px]">
-              <span className={c.ok ? 'text-emerald-600' : 'text-red-600'}>{c.ok ? '✓' : '✗'}</span>
-              <span className={c.ok ? 'text-stone-600' : 'text-red-600'}>{c.label}</span>
+              <span className={c.ok ? 'text-[#4ADE80]' : 'text-[#F87171]'}>{c.ok ? '✓' : '✗'}</span>
+              <span className={c.ok ? 'text-stone-200' : 'text-[#F87171]'}>{c.label}</span>
             </li>
           ))}
         </ul>
         {!verification.valid && (
-          <div className="mt-4 rounded-lg border border-red-200 bg-red-500/[0.04] p-3 text-[11px]">
-            <p className="font-semibold text-red-600">Hash mismatch detected.</p>
-            <p className="mt-1 text-stone-600">
+          <div className="mt-4 rounded-lg border border-[#F87171]/25 bg-[#F87171]/[0.08] p-3 text-[11px]">
+            <p className="font-semibold text-[#F87171]">Hash mismatch detected.</p>
+            <p className="mt-1 text-stone-300">
               Content was modified after the hash was computed. Break point: {verification.break_at || decision.decision_id}.
             </p>
             <div className="mt-2 space-y-1 font-mono text-[10px]">
-              <p className="text-stone-500">Expected: {decision.decision_hash.slice(0, 32)}…</p>
-              <p className="text-red-600">Actual: content no longer matches</p>
+              <p className="text-stone-400">Expected: {decision.decision_hash.slice(0, 32)}…</p>
+              <p className="text-[#F87171]">Actual: content no longer matches</p>
             </div>
           </div>
         )}
-        <p className="mt-3 text-[10px] text-stone-500">
+        <p className="mt-3 text-[10px] text-stone-400">
           {verification.checked_count} record(s) verified from genesis.
         </p>
       </div>
@@ -359,55 +359,55 @@ export default function DecisionDetail() {
               <h2 className="section-label mb-4">Financial Breakdown</h2>
 
               {/* Gross → Deductions → Final */}
-              <div className="flex flex-col sm:flex-row items-baseline gap-3 sm:gap-6 border-b border-[var(--border)] pb-4">
+              <div className="flex flex-col sm:flex-row items-baseline gap-3 sm:gap-6 border-b border-white/10 pb-4">
                 <div>
-                  <p className="text-[10px] uppercase tracking-wider text-stone-500">Gross entitlement</p>
-                  <p className="amount mt-0.5 text-3xl text-stone-800">{formatINR(gross)}</p>
+                  <p className="text-[10px] uppercase tracking-wider text-stone-400">Gross entitlement</p>
+                  <p className="amount mt-0.5 text-3xl text-stone-50">{formatINR(gross)}</p>
                 </div>
                 <span className="hidden sm:inline text-stone-500">→</span>
                 <div>
-                  <p className="text-[10px] uppercase tracking-wider text-stone-500">Deductions</p>
-                  <p className="amount mt-0.5 text-3xl text-red-600">−{formatINR(adj)}</p>
+                  <p className="text-[10px] uppercase tracking-wider text-stone-400">Deductions</p>
+                  <p className="amount mt-0.5 text-3xl text-[#F87171]">−{formatINR(adj)}</p>
                 </div>
                 <span className="hidden sm:inline text-stone-500">→</span>
                 <div>
-                  <p className="text-[10px] uppercase tracking-wider text-stone-500">Final entitlement</p>
-                  <p className="amount mt-0.5 text-3xl text-emerald-600">{formatINR(decision.final_amount)}</p>
+                  <p className="text-[10px] uppercase tracking-wider text-stone-400">Final entitlement</p>
+                  <p className="amount mt-0.5 text-3xl text-[#4ADE80]">{formatINR(decision.final_amount)}</p>
                 </div>
               </div>
 
               {/* Waterfall bar */}
               <div className="mt-4 space-y-1.5">
                 <div className="flex items-center gap-3">
-                  <span className="w-20 shrink-0 text-right text-[10px] text-stone-500">Gross</span>
-                  <div className="flex-1 h-6 rounded bg-purple-600/20" style={{ width: '100%' }}>
-                    <div className="h-full rounded bg-purple-600/50" style={{ width: '100%' }} />
+                  <span className="w-20 shrink-0 text-right text-[10px] text-stone-400">Gross</span>
+                  <div className="flex-1 h-6 rounded bg-purple-500/25" style={{ width: '100%' }}>
+                    <div className="h-full rounded bg-purple-500/50" style={{ width: '100%' }} />
                   </div>
-                  <span className="amount w-24 text-right text-[11px] text-stone-800">{formatINR(gross)}</span>
+                  <span className="amount w-24 text-right text-[11px] text-stone-100">{formatINR(gross)}</span>
                 </div>
                 {decision.line_items.map((item, i) => {
                   const pct = gross > 0 ? (item.amount / gross) * 100 : 0;
                   
                   return (
                     <div key={i} className="flex items-center gap-3">
-                      <span className="w-20 shrink-0 text-right text-[10px] text-stone-500 truncate">−{item.label}</span>
-                      <div className="flex-1 h-5 rounded bg-white/[0.02] relative overflow-hidden">
-                        <div className="absolute right-0 top-0 h-full rounded bg-red-500/25" style={{ width: `${pct}%` }} />
+                      <span className="w-20 shrink-0 text-right text-[10px] text-stone-400 truncate">−{item.label}</span>
+                      <div className="flex-1 h-5 rounded bg-white/[0.04] relative overflow-hidden">
+                        <div className="absolute right-0 top-0 h-full rounded bg-[#F87171]/30" style={{ width: `${pct}%` }} />
                       </div>
-                      <span className="amount w-24 text-right text-[11px] text-red-600">−{formatINR(item.amount)}</span>
+                      <span className="amount w-24 text-right text-[11px] text-[#F87171]">−{formatINR(item.amount)}</span>
                     </div>
                   );
                 })}
-                <div className="flex items-center gap-3 pt-1 border-t border-[var(--border)]">
-                  <span className="w-20 shrink-0 text-right text-[10px] font-semibold text-stone-500">Final</span>
-                  <div className="flex-1 h-6 rounded bg-white/[0.02] relative overflow-hidden">
-                    <div className="h-full rounded bg-emerald-500/30" style={{ width: `${gross > 0 ? (decision.final_amount / gross) * 100 : 100}%` }} />
+                <div className="flex items-center gap-3 pt-1 border-t border-white/10">
+                  <span className="w-20 shrink-0 text-right text-[10px] font-semibold text-stone-400">Final</span>
+                  <div className="flex-1 h-6 rounded bg-white/[0.04] relative overflow-hidden">
+                    <div className="h-full rounded bg-[#4ADE80]/35" style={{ width: `${gross > 0 ? (decision.final_amount / gross) * 100 : 100}%` }} />
                   </div>
-                  <span className="amount w-24 text-right text-[11px] font-semibold text-emerald-600">{formatINR(decision.final_amount)}</span>
+                  <span className="amount w-24 text-right text-[11px] font-semibold text-[#4ADE80]">{formatINR(decision.final_amount)}</span>
                 </div>
               </div>
 
-              <p className="mt-4 text-[10px] text-stone-500">
+              <p className="mt-4 text-[10px] text-stone-400">
                 Amounts computed by deterministic application logic — the AI model never decides financial values.
               </p>
             </div>

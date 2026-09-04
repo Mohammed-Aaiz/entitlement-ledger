@@ -1,28 +1,44 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import "tailwindcss";
 
 @layer base {
   :root {
-    --bg-primary: #fdfdfc;
+    --bg-primary: #fbfbfa;
     --bg-secondary: #f3f3f1;
     --border: rgba(0, 0, 0, 0.08);
+    --border-strong: rgba(0, 0, 0, 0.13);
     --text-primary: #1c1917;
     --text-secondary: #57534e;
-    --text-muted: #a8a29e;
+    --text-muted: #79716b;
     
-    --accent: #e945f5;
-    --accent-dim: rgba(233, 69, 245, 0.1);
+    --accent: #9333ea;
+    --accent-strong: #7e22ce;
+    --accent-dim: rgba(147, 51, 234, 0.08);
     
     --success: #10b981;
     --success-dim: rgba(16, 185, 129, 0.1);
-    --warning: #f59e0b;
-    --warning-dim: rgba(245, 158, 11, 0.1);
-    --danger: #ef4444;
-    --danger-dim: rgba(239, 68, 68, 0.1);
+    --warning: #d97706;
+    --warning-dim: rgba(217, 119, 6, 0.1);
+    --danger: #dc2626;
+    --danger-dim: rgba(220, 38, 38, 0.08);
 
-    --font-sans: 'Inter', -apple-system, sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
+    --font-sans: 'Inter', 'Inter Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-display: 'Inter', 'Inter Fallback', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    --font-mono: 'JetBrains Mono', 'JetBrains Mono Fallback', ui-monospace, 'SF Mono', Menlo, monospace;
+
+    --radius-sm: 8px;
+    --radius-md: 12px;
+    --radius-lg: 16px;
+    --radius-xl: 20px;
+
+    --shadow-card: 0 1px 2px rgba(16, 16, 20, 0.04), 0 8px 24px -12px rgba(16, 16, 20, 0.08);
+    --shadow-pop: 0 24px 48px -16px rgba(16, 16, 20, 0.18);
+  }
+
+  html,
+  body {
+    /* Decorative full-bleed layers (3D canvas, glow halos) intentionally exceed
+       the viewport; clip horizontally without creating a scroll container. */
+    overflow-x: clip;
   }
 
   body {
@@ -30,7 +46,44 @@
     color: var(--text-primary);
     font-family: var(--font-sans);
     -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: 'cv11', 'ss01';
+    font-size: 15px;
+    line-height: 1.5;
   }
+
+  :focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--accent) 65%, transparent);
+    outline-offset: 2px;
+    border-radius: 4px;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--accent) 18%, transparent);
+    color: var(--text-primary);
+  }
+
+  button,
+  a,
+  input,
+  textarea,
+  select,
+  summary {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  h1, h2, h3, h4 {
+    letter-spacing: -0.015em;
+  }
+
+  /* Slim, quiet scrollbars */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: rgba(0, 0, 0, 0.18) transparent;
+  }
+  *::-webkit-scrollbar { width: 8px; height: 8px; }
+  *::-webkit-scrollbar-thumb { background: rgba(0, 0, 0, 0.16); border-radius: 8px; }
+  *::-webkit-scrollbar-track { background: transparent; }
 }
 
 @layer utilities {
@@ -98,10 +151,43 @@
 
 .section-label {
   font-size: 10px;
-  font-weight: 600;
+  font-weight: 650;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--text-muted);
+}
+
+/* Brand buttons: consistent white-on-violet accent for every purple CTA. */
+button.bg-purple-600,
+a.bg-purple-600 {
+  color: #ffffff;
+}
+button.bg-purple-600 .text-\[\#0B0A0F\],
+a.bg-purple-600 .text-\[\#0B0A0F\] {
+  color: #ffffff;
+}
+
+/* Base form controls: consistent premium feel even without utility classes. */
+input[type='text'],
+input[type='email'],
+input[type='password'],
+input[type='number'],
+input[type='search'],
+textarea,
+select {
+  border-radius: var(--radius-sm);
+  transition: border-color 160ms var(--ease-smooth), box-shadow 160ms var(--ease-smooth);
+}
+input[type='text']:focus,
+input[type='email']:focus,
+input[type='password']:focus,
+input[type='number']:focus,
+input[type='search']:focus,
+textarea:focus,
+select:focus {
+  border-color: color-mix(in srgb, var(--accent) 45%, transparent) !important;
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--accent) 12%, transparent) !important;
+  outline: none;
 }
 
 @keyframes skeleton-pulse {
@@ -120,6 +206,11 @@
     animation: none;
     opacity: 0.2;
   }
+}
+
+/* Inside the dark “ledger” glow panels, section labels must read light. */
+.border-glow-card .section-label {
+  color: rgba(245, 245, 244, 0.55);
 }
 
 @media print {

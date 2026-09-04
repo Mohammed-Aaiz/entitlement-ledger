@@ -89,16 +89,16 @@ export default function AuditTrail() {
             <div className="flex items-center gap-3">
               <span className={`inline-flex h-10 w-10 items-center justify-center rounded-full text-lg font-bold verify-transition ${
                 chainResult.valid
-                  ? 'bg-emerald-500/15 text-emerald-600'
-                  : 'bg-red-500/15 text-red-600'
+                  ? 'bg-[#4ADE80]/15 text-[#4ADE80]'
+                  : 'bg-[#F87171]/15 text-[#F87171]'
               }`}>
                 {chainResult.valid ? '✓' : '✗'}
               </span>
               <div>
-                <p className={`text-sm font-semibold verify-transition ${chainResult.valid ? 'text-emerald-600' : 'text-red-600'}`}>
+                <p className={`text-sm font-semibold verify-transition ${chainResult.valid ? 'text-[#4ADE80]' : 'text-[#F87171]'}`}>
                   {chainResult.valid ? 'Integrity Verified' : 'Integrity Compromised'}
                 </p>
-                <p className="mt-0.5 text-xs text-stone-600">
+                <p className="mt-0.5 text-xs text-stone-300">
                   Checked {chainResult.checked_count} record(s) from genesis.
                   {chainResult.valid
                     ? ' Every record matches its computed hash.'

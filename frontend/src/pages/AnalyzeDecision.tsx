@@ -148,36 +148,36 @@ export default function AnalyzeDecision() {
         >
           <div className="p-6">
             <div className="flex items-center gap-2 mb-4">
-              <span className="rounded bg-purple-600/10 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-purple-600">
+              <span className="rounded bg-purple-400/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider text-purple-300">
                 Analyzed
               </span>
               <span className={`rounded px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wider ${
                 result.decision_status === 'REVIEW_REQUIRED'
-                  ? 'bg-amber-500/10 text-amber-500'
-                  : 'bg-emerald-500/10 text-emerald-600'
+                  ? 'bg-amber-400/15 text-amber-300'
+                  : 'bg-[#4ADE80]/15 text-[#4ADE80]'
               }`}>
                 {result.decision_status}
               </span>
             </div>
 
             <div className="flex items-baseline gap-3 mb-4">
-              <span className="amount text-3xl text-stone-800">{formatINR(result.gross_amount)}</span>
-              <span className="text-stone-500">→</span>
-              <span className="amount text-3xl text-emerald-600">{formatINR(result.final_amount)}</span>
+              <span className="amount text-3xl text-stone-100">{formatINR(result.gross_amount)}</span>
+              <span className="text-stone-400">→</span>
+              <span className="amount text-3xl text-[#4ADE80]">{formatINR(result.final_amount)}</span>
             </div>
 
             {/* Line items */}
             <div className="space-y-2 mb-4">
               {result.line_items.map((li, i) => (
-                <div key={i} className="flex items-center justify-between rounded-md border border-[var(--border)] bg-white/[0.02] px-3 py-2">
-                  <span className="text-xs text-stone-600">{li.label}</span>
-                  <span className="amount text-xs text-red-600">−{formatINR(li.amount)}</span>
+                <div key={i} className="flex items-center justify-between rounded-md border border-white/10 bg-white/[0.04] px-3 py-2">
+                  <span className="text-xs text-stone-300">{li.label}</span>
+                  <span className="amount text-xs text-[#F87171]">−{formatINR(li.amount)}</span>
                 </div>
               ))}
             </div>
 
             {/* Evidence + hash */}
-            <div className="flex flex-wrap gap-3 text-[11px] text-stone-500">
+            <div className="flex flex-wrap gap-3 text-[11px] text-stone-300">
               <span>{result.evidence_count} evidence record{result.evidence_count !== 1 ? 's' : ''}</span>
               <span>·</span>
               <span>{result.claims.length} claim{result.claims.length !== 1 ? 's' : ''}</span>
@@ -189,14 +189,14 @@ export default function AnalyzeDecision() {
             <div className="mt-5 flex flex-wrap gap-3">
               <Link
                 to={`/decisions/${result.decision_id}`}
-                className="inline-flex items-center gap-1.5 rounded-lg bg-purple-600 px-4 py-2 text-sm font-semibold text-[#0B0A0F] btn-smooth hover:bg-purple-700"
+                className="inline-flex items-center gap-1.5 rounded-lg bg-purple-600 px-4 py-2 text-sm font-semibold text-white btn-smooth hover:bg-purple-500"
               >
                 View Decision Detail →
               </Link>
               <button
                 type="button"
                 onClick={() => { setResult(null); setEvidenceItems([]); setGrossAmount(''); setEntityId(''); }}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-white/[0.12] px-4 py-2 text-sm font-medium text-stone-600 btn-smooth hover:border-purple-200 hover:text-stone-800"
+                className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 px-4 py-2 text-sm font-medium text-stone-200 btn-smooth hover:border-purple-300/50 hover:text-white"
               >
                 New Analysis
               </button>
@@ -209,20 +209,20 @@ export default function AnalyzeDecision() {
           <h2 className="section-label">Provenance Chain</h2>
           <div className="flex flex-col gap-0">
             {[
-              { label: 'Evidence', detail: `${result.evidence_count} records ingested`, color: '#8B95A5' },
-              { label: 'Extracted Facts', detail: `${result.line_items.length} line items derived`, color: '#8B95A5' },
-              { label: 'Policy Match', detail: `${result.claims.length} policy clause(s) applied`, color: '#D9A441' },
-              { label: 'Deterministic Calculation', detail: `${formatINR(result.gross_amount)} → ${formatINR(result.final_amount)}`, color: '#D9A441' },
-              { label: 'Decision Created', detail: result.decision_id, color: '#F5F7FA' },
-              { label: 'Hash Computed', detail: `${result.decision_hash.slice(0, 24)}…`, color: '#4ADE80' },
+              { label: 'Evidence', detail: `${result.evidence_count} records ingested`, cls: 'text-stone-500', dot: 'border-stone-400', solid: false },
+              { label: 'Extracted Facts', detail: `${result.line_items.length} line items derived`, cls: 'text-stone-500', dot: 'border-stone-400', solid: false },
+              { label: 'Policy Match', detail: `${result.claims.length} policy clause(s) applied`, cls: 'text-violet-700', dot: 'border-violet-500', solid: false },
+              { label: 'Deterministic Calculation', detail: `${formatINR(result.gross_amount)} → ${formatINR(result.final_amount)}`, cls: 'text-stone-800', dot: 'border-stone-700', solid: false },
+              { label: 'Decision Created', detail: result.decision_id, cls: 'text-stone-800', dot: 'border-stone-700', solid: false },
+              { label: 'Hash Computed', detail: `${result.decision_hash.slice(0, 24)}…`, cls: 'text-emerald-700', dot: 'border-emerald-500', solid: true },
             ].map((stage, i) => (
               <div key={i} className="flex items-start gap-3">
                 <div className="flex flex-col items-center">
-                  <div className="h-2.5 w-2.5 rounded-full border-2" style={{ borderColor: stage.color, backgroundColor: i === 5 ? stage.color : 'transparent' }} />
-                  {i < 5 && <div className="w-px h-6 bg-white/[0.08]" />}
+                  <div className={`h-2.5 w-2.5 rounded-full border-2 ${stage.dot} ${stage.solid ? 'bg-emerald-500 border-emerald-500' : ''}`} />
+                  {i < 5 && <div className="w-px h-6 bg-black/[0.08]" />}
                 </div>
                 <div className="pb-2">
-                  <p className="text-xs font-medium" style={{ color: stage.color }}>{stage.label}</p>
+                  <p className={`text-xs font-semibold ${stage.cls}`}>{stage.label}</p>
                   <p className="text-[11px] font-mono text-stone-500">{stage.detail}</p>
                 </div>
               </div>
@@ -329,7 +329,7 @@ export default function AnalyzeDecision() {
         </div>
 
         {evidenceItems.length === 0 && (
-          <div className="rounded-lg border border-dashed border-white/[0.12] bg-white/60/50 p-6 text-center">
+          <div className="rounded-lg border border-dashed border-black/[0.14] bg-white/40 p-6 text-center">
             <p className="text-xs text-stone-500">No evidence added yet. Add order records, delivery data, complaints, or refund records.</p>
           </div>
         )}

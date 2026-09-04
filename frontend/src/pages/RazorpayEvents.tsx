@@ -18,13 +18,13 @@ function StepBox({ label, active }: { label: string; active: boolean }) {
 }
 
 const EVT_COLORS: Record<string, string> = {
-  'payment.captured': 'bg-emerald-500/10 text-emerald-600',
-  'payment.failed': 'bg-red-500/10 text-red-600',
-  'payment.authorized': 'bg-purple-600/10 text-purple-600',
-  'order.paid': 'bg-purple-600/10 text-purple-600',
-  'refund.created': 'bg-purple-400/10 text-purple-300',
-  'refund.processed': 'bg-sky-400/10 text-sky-300',
-  'settlement.processed': 'bg-emerald-500/10 text-emerald-600',
+  'payment.captured': 'bg-emerald-500/10 text-emerald-700',
+  'payment.failed': 'bg-red-500/10 text-red-700',
+  'payment.authorized': 'bg-violet-500/10 text-violet-700',
+  'order.paid': 'bg-violet-500/10 text-violet-700',
+  'refund.created': 'bg-purple-500/10 text-purple-700',
+  'refund.processed': 'bg-sky-500/10 text-sky-700',
+  'settlement.processed': 'bg-emerald-500/10 text-emerald-700',
 };
 
 const SOURCE_BADGES: Record<string, { label: string; className: string }> = {
@@ -247,7 +247,7 @@ export default function RazorpayEvents() {
           <div className="overflow-x-auto">
             <table className="w-full min-w-[750px] text-sm">
               <thead>
-                <tr className="border-b border-white/[0.04] text-left text-[10px] uppercase tracking-wider text-stone-500">
+                <tr className="border-b border-black/[0.05] text-left text-[10px] uppercase tracking-wider text-stone-500">
                   <th className="px-4 py-2.5 font-medium">Event</th>
                   <th className="px-4 py-2.5 font-medium">Type</th>
                   <th className="px-4 py-2.5 font-medium">Source</th>
@@ -257,7 +257,7 @@ export default function RazorpayEvents() {
                   <th className="px-4 py-2.5 font-medium"></th>
                 </tr>
               </thead>
-              <tbody className="divide-y divide-white/[0.04]">
+              <tbody className="divide-y divide-black/[0.04]">
                 {events.map((ev) => (
                   <tr key={ev.event_id} className="row-hover">
                     <td className="px-4 py-3 font-mono text-[11px] text-stone-600">{ev.event_id.slice(0, 16)}…</td>
