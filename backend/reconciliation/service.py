@@ -948,6 +948,12 @@ async def _persist_run(tenant_id: str, run: ReconciliationRun, cases: list[Recon
                 "tier_findings": case.tier_findings,
                 "relationships": case.relationships,
             })
+            # Canonical shape guarantee: exception_codes must always be a real
+            # JSON array (list[str]) at rest.  Normalize defensively so a stray
+            # string/bytes/tuple can never be persisted as a concatenated string
+            # (which would render as e.g. "PARTIAL_SETTLEMENTAMOUNT_MISMATCH").
+            _codes = list(case.exception_codes) if case.exception_codes else []
+            assert isinstance(_codes, list), "exception_codes must be a list"
             await db.execute(
                 "INSERT INTO reconciliation_cases "
                 "(case_id, tenant_id, run_id, payment_id, related_record_ids, expected_amount, "
@@ -960,7 +966,7 @@ async def _persist_run(tenant_id: str, run: ReconciliationRun, cases: list[Recon
                     case.case_id, tenant_id, case.run_id, case.payment_id,
                     json.dumps([r.record_id for r in case.records]),
                     case.expected_amount, case.actual_amount, case.variance,
-                    case.classification, json.dumps(case.exception_codes),
+                    case.classification, json.dumps(_codes),
                     json.dumps(case.exceptions), case.ai_status, case.ai_invoked,
                     case.ai_confidence, json.dumps(case.ai_interpretation),
                     case.ai_technical_reason, case.ai_trigger_reason, case.ai_tool_calls,

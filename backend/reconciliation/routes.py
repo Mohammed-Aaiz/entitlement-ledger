@@ -85,6 +85,20 @@ def _parse_json_field(val):
     return val if val else {}
 
 
+def _parse_exception_codes(val) -> list[str]:
+    """Return exception_codes as a real list[str] from a DB row.
+
+    Canonical at-rest/on-the-wire shape is a JSON array of distinct code
+    strings.  If the stored value is malformed (e.g. a concatenated string
+    left over from a prior deploy), coerce to an empty list rather than
+    heuristically splitting it.
+    """
+    parsed = _parse_json_field(val)
+    if isinstance(parsed, list):
+        return [str(c) for c in parsed]
+    return []
+
+
 def _iso_or_blank(val):
     """Normalize a DB timestamp to a string for API responses.
 
@@ -158,7 +172,7 @@ def _case_to_response(row) -> dict:
         "expected_amount": row["expected_amount"],
         "actual_amount": row["actual_amount"],
         "variance": row["variance"],
-        "exception_codes": _parse_json_field(row["exception_codes"]),
+        "exception_codes": _parse_exception_codes(row["exception_codes"]),
         "exceptions": _parse_json_field(row["exceptions"]),
         "ai_status": row["ai_status"],
         "ai_invoked": bool(row["ai_invoked"]),

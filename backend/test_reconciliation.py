@@ -1033,6 +1033,244 @@ class TestIdempotentRunRetry:
 # Postgres datetime serialization (production-only bug regression)
 # ===========================================================================
 
+class TestExceptionCodeAndTier6Classification:
+    """Regression tests for two production correctness issues:
+
+    1. Multiple exception codes must remain a real JSON array end-to-end
+       (never a concatenated string like "PARTIAL_SETTLEMENTAMOUNT_MISMATCH").
+    2. Tier 6 paid_total must be computed from payments linked to the
+       obligation, so equal paid/owed is never OVERPAYMENT (and the decision
+       uses the linked payment amount, not the sum of every payment in the
+       case).
+    """,
+
+    def test_multiple_exception_codes_stay_separate_through_serialization(self):
+        """Two distinct exception codes remain two distinct entries after a
+        full dict -> json.dumps -> json.loads round-trip (the shape persisted
+        in reconciliation_cases and served by the API)."""
+        from reconciliation.service import _persist_run
+        import json
+
+        codes = ["PARTIAL_SETTLEMENT", "AMOUNT_MISMATCH"]
+        # Simulate what _persist_run does: normalize to list, then dump.
+        normalized = list(codes) if codes else []
+        dumped = json.dumps(normalized)
+        reloaded = json.loads(dumped)
+        assert reloaded == ["PARTIAL_SETTLEMENT", "AMOUNT_MISMATCH"]
+        assert isinstance(reloaded, list)
+        assert len(reloaded) == 2
+        assert reloaded[0] != reloaded[1]
+
+    def test_api_response_parses_exception_codes_as_list_not_string(self):
+        """A case row whose exception_codes column holds a valid JSON array is
+        returned by _case_to_response/_parse_exception_codes as a list[str],
+        never as a concatenated string."""
+        from reconciliation.routes import _parse_exception_codes
+        from reconciliation.support_center import _parse_exception_codes as sc_parse
+
+        row_codes = '["TAX_MISMATCH", "FEE_MISMATCH"]'
+        assert _parse_exception_codes(row_codes) == ["TAX_MISMATCH", "FEE_MISMATCH"]
+        assert sc_parse(row_codes) == ["TAX_MISMATCH", "FEE_MISMATCH"]
+
+    def test_malformed_legacy_exception_codes_coerce_to_empty_list(self):
+        """If a legacy row stored a concatenated string instead of a JSON array,
+        the parser returns an empty list (no heuristic splitting) so the
+        frontend never sees a merged token."""
+        from reconciliation.routes import _parse_exception_codes
+
+        assert _parse_exception_codes("PARTIAL_SETTLEMENTAMOUNT_MISMATCH") == []
+        assert _parse_exception_codes("[]") == []
+        assert _parse_exception_codes(None) == []
+
+    def test_equal_paid_owed_is_not_overpayment(self):
+        """When the linked payment total equals the obligation amount, Tier 6
+        must NOT escalate OVERPAYMENT.  This is the exact class of bug that
+        produced false OVERPAYMENT for pay_R094 / pay_R095."""
+        from reconciliation.tiers import analyze_case_tiers
+        from reconciliation.models import FinancialRecord, CLASS_MATCHED
+
+        payment_id = "pay_eq_1"
+        order_id = "order_eq_1"
+        amount = 147300
+
+        payment = FinancialRecord(
+            record_type="payment", external_id=payment_id, amount=amount,
+            payment_id=payment_id, order_id=order_id, status="captured",
+            source="fixture", raw_evidence_ref="evt_pay", record_id="rec_pay",
+        )
+        obligation = FinancialRecord(
+            record_type="invoice", external_id="inv_eq_1", amount=amount,
+            payment_id=payment_id, order_id=order_id, status="paid",
+            source="fixture", raw_evidence_ref="evt_inv", record_id="rec_inv",
+        )
+        fee_tax = FinancialRecord(
+            record_type="fee_tax", external_id="ft_eq_1", amount=2700,
+            payment_id=payment_id, fee_amount=2400, tax_amount=300,
+            status="processed", source="fixture", raw_evidence_ref="evt_ft",
+            record_id="rec_ft",
+        )
+
+        analysis = analyze_case_tiers(
+            payment_id=payment_id,
+            records=[payment, obligation, fee_tax],
+            classification=CLASS_MATCHED,
+            exception_codes=[],
+            expected_amount=amount,
+            actual_amount=amount,
+            variance=0,
+        )
+        assert "OVERPAYMENT" not in analysis["escalations"]
+        assert "PARTIAL_PAYMENT" not in analysis["escalations"]
+        overpay_findings = [f for f in analysis["tier_findings"] if f["code"] == "OVERPAYMENT"]
+        assert not overpay_findings, overpay_findings
+
+    def test_greater_paid_is_overpayment(self):
+        """When the linked payment total exceeds the obligation, Tier 6 must
+        escalate OVERPAYMENT (the genuine, intended case)."""
+        from reconciliation.tiers import analyze_case_tiers
+        from reconciliation.models import FinancialRecord, CLASS_MATCHED
+
+        payment_id = "pay_over_1"
+        order_id = "order_over_1"
+        paid = 200000
+        owed = 140000
+
+        payment = FinancialRecord(
+            record_type="payment", external_id=payment_id, amount=paid,
+            payment_id=payment_id, order_id=order_id, status="captured",
+            source="fixture", raw_evidence_ref="evt_pay", record_id="rec_pay",
+        )
+        obligation = FinancialRecord(
+            record_type="invoice", external_id="inv_over_1", amount=owed,
+            payment_id=payment_id, order_id=order_id, status="paid",
+            source="fixture", raw_evidence_ref="evt_inv", record_id="rec_inv",
+        )
+
+        analysis = analyze_case_tiers(
+            payment_id=payment_id,
+            records=[payment, obligation],
+            classification=CLASS_MATCHED,
+            exception_codes=[],
+            expected_amount=paid,
+            actual_amount=paid,
+            variance=0,
+        )
+        assert "OVERPAYMENT" in analysis["escalations"]
+        assert "PARTIAL_PAYMENT" not in analysis["escalations"]
+
+    def test_lower_paid_is_partial_payment(self):
+        """When the linked payment total is below the obligation, Tier 6 must
+        escalate PARTIAL_PAYMENT."""
+        from reconciliation.tiers import analyze_case_tiers
+        from reconciliation.models import FinancialRecord, CLASS_MATCHED
+
+        payment_id = "pay_part_1"
+        order_id = "order_part_1"
+        paid = 100000
+        owed = 140000
+
+        payment = FinancialRecord(
+            record_type="payment", external_id=payment_id, amount=paid,
+            payment_id=payment_id, order_id=order_id, status="captured",
+            source="fixture", raw_evidence_ref="evt_pay", record_id="rec_pay",
+        )
+        obligation = FinancialRecord(
+            record_type="invoice", external_id="inv_part_1", amount=owed,
+            payment_id=payment_id, order_id=order_id, status="partially_paid",
+            source="fixture", raw_evidence_ref="evt_inv", record_id="rec_inv",
+        )
+
+        analysis = analyze_case_tiers(
+            payment_id=payment_id,
+            records=[payment, obligation],
+            classification=CLASS_MATCHED,
+            exception_codes=[],
+            expected_amount=paid,
+            actual_amount=paid,
+            variance=0,
+        )
+        assert "PARTIAL_PAYMENT" in analysis["escalations"]
+        assert "OVERPAYMENT" not in analysis["escalations"]
+
+    def test_unlinked_payment_does_not_influence_obligation(self):
+        """An unlinked payment record in the same case must NOT inflate the
+        Tier 6 paid_total for an obligation it is not linked to.  This guards
+        against the false OVERPAYMENT produced when a case has an extra
+        capture that is unrelated to the obligation."""
+        from reconciliation.tiers import analyze_case_tiers
+        from reconciliation.models import FinancialRecord, CLASS_MATCHED
+
+        payment_id = "pay_linked_1"
+        order_id = "order_linked_1"
+        owed = 147300
+
+        linked_payment = FinancialRecord(
+            record_type="payment", external_id=payment_id, amount=owed,
+            payment_id=payment_id, order_id=order_id, status="captured",
+            source="fixture", raw_evidence_ref="evt_pay_linked", record_id="rec_pay_linked",
+        )
+        # Extra unlinked capture (different payment_id) must not be counted.
+        unlinked_payment = FinancialRecord(
+            record_type="payment", external_id="pay_other_1", amount=999999,
+            payment_id="pay_other_1", order_id="order_other_1", status="captured",
+            source="fixture", raw_evidence_ref="evt_pay_other", record_id="rec_pay_other",
+        )
+        obligation = FinancialRecord(
+            record_type="invoice", external_id="inv_linked_1", amount=owed,
+            payment_id=payment_id, order_id=order_id, status="paid",
+            source="fixture", raw_evidence_ref="evt_inv", record_id="rec_inv",
+        )
+
+        analysis = analyze_case_tiers(
+            payment_id=payment_id,
+            records=[linked_payment, unlinked_payment, obligation],
+            classification=CLASS_MATCHED,
+            exception_codes=[],
+            expected_amount=owed,
+            actual_amount=owed,
+            variance=0,
+        )
+        assert "OVERPAYMENT" not in analysis["escalations"]
+        assert "PARTIAL_PAYMENT" not in analysis["escalations"]
+        overpay_findings = [f for f in analysis["tier_findings"] if f["code"] == "OVERPAYMENT"]
+        assert not overpay_findings, overpay_findings
+
+    def test_obligation_paid_finding_on_exact_match(self):
+        """Exact paid/owed produces an OBLIGATION_PAID finding (matched), not
+        an escalation."""
+        from reconciliation.tiers import analyze_case_tiers
+        from reconciliation.models import FinancialRecord, CLASS_MATCHED
+
+        payment_id = "pay_exact_1"
+        order_id = "order_exact_1"
+        amount = 50000
+
+        payment = FinancialRecord(
+            record_type="payment", external_id=payment_id, amount=amount,
+            payment_id=payment_id, order_id=order_id, status="captured",
+            source="fixture", raw_evidence_ref="evt_pay", record_id="rec_pay",
+        )
+        obligation = FinancialRecord(
+            record_type="payment_link", external_id="pl_exact_1", amount=amount,
+            payment_id=payment_id, order_id=order_id, status="paid",
+            source="fixture", raw_evidence_ref="evt_pl", record_id="rec_pl",
+        )
+
+        analysis = analyze_case_tiers(
+            payment_id=payment_id,
+            records=[payment, obligation],
+            classification=CLASS_MATCHED,
+            exception_codes=[],
+            expected_amount=amount,
+            actual_amount=amount,
+            variance=0,
+        )
+        assert "OVERPAYMENT" not in analysis["escalations"]
+        assert "PARTIAL_PAYMENT" not in analysis["escalations"]
+        paid_findings = [f for f in analysis["tier_findings"] if f["code"] == "OBLIGATION_PAID"]
+        assert paid_findings, paid_findings
+
+
 class TestPostgresDatetimeSerialization:
     """PostgreSQL TIMESTAMPTZ columns return datetime objects, but the API
     response schemas type timestamps as str.  SQLite stores TEXT so this

@@ -359,11 +359,21 @@ def analyze_case_tiers(
     # ── Tier 6: Invoice / Payment Link obligation ──
     if 6 in tiers_present:
         obligations = by_type[RECORD_INVOICE] + by_type[RECORD_PAYMENT_LINK]
-        paid_total = sum(r.amount for r in by_type[RECORD_PAYMENT])
+        # Paid total must be computed PER-OBLIGATION from the payments linked to
+        # that obligation (by payment_id or order_id), NOT the sum of every
+        # payment record in the case.  Summing all payment records would
+        # double-count unrelated/duplicate captures and falsely escalate
+        # OVERPAYMENT when the linked payment total actually equals the
+        # obligation (e.g. pay_R094 / pay_R095 style cases).
         for ob in obligations:
             owed = ob.amount or 0
             status_s = (ob.status or "").lower().strip()
             refs = [ob.raw_evidence_ref]
+            linked_payments = [
+                r for r in by_type[RECORD_PAYMENT]
+                if r.payment_id == payment_id or r.order_id == ob.order_id
+            ]
+            paid_total = sum(r.amount for r in linked_payments)
             if owed and paid_total:
                 if paid_total < owed:
                     _finding(6, "PARTIAL_PAYMENT", "action",

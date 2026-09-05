@@ -362,8 +362,22 @@ TIER_LABELS = {
 }
 
 
+def _parse_exception_codes(val) -> list[str]:
+    """Return exception_codes as a real list[str] from a DB row.
+
+    Canonical at-rest/on-the-wire shape is a JSON array of distinct code
+    strings.  If the stored value is malformed (e.g. a concatenated string
+    left over from a prior deploy), coerce to an empty list rather than
+    heuristically splitting it.
+    """
+    parsed = _parse_json(val)
+    if isinstance(parsed, list):
+        return [str(c) for c in parsed]
+    return []
+
+
 def _case_summary_dict(row) -> dict:
-    codes = _parse_json(row["exception_codes"])
+    codes = _parse_exception_codes(row["exception_codes"])
     return {
         "case_id": row["case_id"],
         "payment_id": row["payment_id"],
@@ -398,7 +412,7 @@ def _case_full_dict(row) -> dict:
         "expected_amount_paise": row["expected_amount"],
         "actual_amount_paise": row["actual_amount"],
         "variance_paise": row["variance"],
-        "exception_codes": _parse_json(row["exception_codes"]),
+        "exception_codes": _parse_exception_codes(row["exception_codes"]),
         "exceptions": _parse_json(row["exceptions"]),
         "explanation": row["explanation"] or "",
         "calculation_trace": _parse_json(row["calculation_trace"]),
