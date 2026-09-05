@@ -1027,3 +1027,77 @@ class TestIdempotentRunRetry:
         assert second.status_code == 200, second.text
         assert first.json()["run_id"] == second.json()["run_id"]
         assert first.json()["total_cases"] == 30
+
+
+# ===========================================================================
+# Postgres datetime serialization (production-only bug regression)
+# ===========================================================================
+
+class TestPostgresDatetimeSerialization:
+    """PostgreSQL TIMESTAMPTZ columns return datetime objects, but the API
+    response schemas type timestamps as str.  SQLite stores TEXT so this
+    only fails in production (Postgres): the idempotent-replay path, run
+    detail and case detail would all 500 with Pydantic validation errors.
+    """
+
+    def test_run_row_with_datetime_serializes_to_schema(self):
+        from datetime import datetime, timezone
+        from reconciliation.routes import _run_to_response
+        from reconciliation.schemas import ReconciliationRunResponse
+
+        ts = datetime(2026, 9, 5, 12, 46, 14, 419897, tzinfo=timezone.utc)
+
+        class Row:
+            def __getitem__(self, k):
+                return self._data[k]
+
+            def keys(self):
+                return self._data.keys()
+
+        row = Row()
+        row._data = {
+            "run_id": "run_pg_1", "status": "completed", "source": "batch",
+            "total_records": 3, "total_cases": 1, "matched": 1, "review_required": 0,
+            "exceptions": 0, "match_rate": 1.0, "classification_accuracy": None,
+            "calculation_accuracy": None, "false_auto_resolve": 0,
+            "throughput_per_sec": 5.0, "p50_latency_ms": 1.0, "p95_latency_ms": 1.0,
+            "duplicates_detected": 0, "audit_completeness": 1.0,
+            "errors": "[]", "started_at": ts, "completed_at": ts,
+        }
+        d = _run_to_response(row)
+        assert isinstance(d["started_at"], str) and d["started_at"].endswith("Z")
+        assert isinstance(d["completed_at"], str)
+        # The exact failure mode in production: schema validation.
+        resp = ReconciliationRunResponse(**d)
+        assert resp.run_id == "run_pg_1"
+
+    def test_case_row_with_datetime_serializes_to_schema(self):
+        from datetime import datetime, timezone
+        from reconciliation.routes import _case_to_response
+        from reconciliation.schemas import ReconciliationCaseResponse
+
+        ts = datetime(2026, 9, 5, 12, 46, 14, 419897, tzinfo=timezone.utc)
+
+        class Row:
+            def __getitem__(self, k):
+                return self._data[k]
+
+            def keys(self):
+                return self._data.keys()
+
+        row = Row()
+        row._data = {
+            "case_id": "rcase_pg_1", "payment_id": "pay_pg_1", "run_id": "run_pg_1",
+            "classification": "MATCHED", "expected_amount": 97300, "actual_amount": 97300,
+            "variance": 0, "exception_codes": "[]", "exceptions": "[]",
+            "ai_status": "not_needed", "ai_invoked": 0, "ai_confidence": None,
+            "ai_interpretation": "{}", "ai_technical_reason": "",
+            "ai_trigger_reason": "", "ai_tool_calls": 0,
+            "calculation_trace": "{}", "match_info": "{}", "tier_analysis": "{}",
+            "decision_id": "", "explanation": "", "related_record_ids": "[]",
+            "created_at": ts,
+        }
+        d = _case_to_response(row)
+        assert isinstance(d["created_at"], str) and d["created_at"].endswith("Z")
+        resp = ReconciliationCaseResponse(**d)
+        assert resp.case_id == "rcase_pg_1"

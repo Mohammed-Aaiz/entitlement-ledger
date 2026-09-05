@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime
 
 from typing import Optional
 
@@ -84,6 +85,23 @@ def _parse_json_field(val):
     return val if val else {}
 
 
+def _iso_or_blank(val):
+    """Normalize a DB timestamp to a string for API responses.
+
+    SQLite stores timestamps as TEXT (already strings), but PostgreSQL
+    TIMESTAMPTZ returns datetime objects — Pydantic response schemas type
+    these fields as ``str``, so raw datetimes must be converted or every
+    response carrying them fails validation in production.
+    """
+    if val is None:
+        return ""
+    if isinstance(val, (datetime, )):
+        if val.tzinfo is None:
+            return val.isoformat()
+        return val.isoformat().replace("+00:00", "Z")
+    return str(val) if val else ""
+
+
 def _run_to_response(row) -> dict:
     return {
         "run_id": row["run_id"],
@@ -104,8 +122,8 @@ def _run_to_response(row) -> dict:
         "duplicates_detected": row["duplicates_detected"],
         "audit_completeness": row["audit_completeness"],
         "errors": _parse_json_field(row["errors"]) if "errors" in row.keys() else [],
-        "started_at": row["started_at"] or "",
-        "completed_at": row["completed_at"] or "",
+        "started_at": _iso_or_blank(row["started_at"]),
+        "completed_at": _iso_or_blank(row["completed_at"]),
     }
 
 
@@ -158,7 +176,7 @@ def _case_to_response(row) -> dict:
         "tier_findings": _ta.get("tier_findings", []),
         "tiers_applied": _ta.get("tiers_applied", []),
         "relationships": _ta.get("relationships", []),
-        "created_at": row["created_at"] or "",
+        "created_at": _iso_or_blank(row["created_at"]),
     }
 
 
