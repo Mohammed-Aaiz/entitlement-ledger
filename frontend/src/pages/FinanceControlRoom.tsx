@@ -4,6 +4,7 @@ import { api } from '../api/client';
 import type { ReconciliationDashboard, ReconciliationCase, ReconciliationRun, Decision } from '../api/types';
 import { formatINR, formatDateTime } from '../lib/format';
 import { SkeletonTable } from '../App';
+import ProductErrorState from '../components/ProductErrorState';
 
 const CLASS_STYLES: Record<string, string> = {
   MATCHED: 'border border-emerald-300/60 bg-emerald-500/10 text-emerald-700',
@@ -20,6 +21,21 @@ const AI_BADGE: Record<string, { label: string; className: string; dot: string }
 };
 
 const HIGH_RISK = new Set(['AMOUNT_MISMATCH', 'DUPLICATE_PAYMENT', 'DUPLICATE_SETTLEMENT', 'REFUND_MISMATCH', 'FEE_MISMATCH', 'TAX_MISMATCH', 'MISSING_PAYMENT', 'INVALID_RECORD', 'CONTRADICTORY_EVIDENCE']);
+
+// Tier 1-7 reconciliation domains (real deterministic findings on each case).
+const TIER_LABELS: Record<number, string> = {
+  1: 'Payment / Order',
+  2: 'Refund',
+  3: 'Settlement',
+  4: 'Fee / Tax',
+  5: 'Dispute / Risk',
+  6: 'Invoice / Payment Link',
+  7: 'Operational / Event Integrity',
+};
+const TIER_DOT: Record<number, string> = {
+  1: 'bg-stone-400', 2: 'bg-sky-500', 3: 'bg-violet-500', 4: 'bg-amber-400',
+  5: 'bg-red-500', 6: 'bg-emerald-500', 7: 'bg-fuchsia-500',
+};
 
 type Tone = 'default' | 'good' | 'warn' | 'bad';
 const TONE_TEXT: Record<Tone, string> = { default: 'text-stone-900', good: 'text-emerald-600', warn: 'text-amber-600', bad: 'text-red-600' };
@@ -65,7 +81,7 @@ function TraceRow({ label, sign, amount, running }: { label: string; sign: strin
 export default function FinanceControlRoom() {
   const [dash, setDash] = useState<ReconciliationDashboard | null>(null);
   const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<Error | null>(null);
   const [running, setRunning] = useState(false);
   const [runMsg, setRunMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [runs, setRuns] = useState<ReconciliationRun[]>([]);
@@ -77,7 +93,7 @@ export default function FinanceControlRoom() {
   const load = () => {
     Promise.all([api.getReconciliationDashboard(), api.getReconciliationRuns(10)])
       .then(([d, r]) => { setDash(d); setRuns(r.runs); if (!selectedRunId && d.latest_run) setSelectedRunId(d.latest_run.run_id); })
-      .catch((e) => setError(e.message))
+      .catch((e) => setError(e instanceof Error ? e : new Error('Finance Control Room unavailable')))
       .finally(() => setLoading(false));
   };
   useEffect(() => { load(); }, []);
@@ -120,10 +136,10 @@ export default function FinanceControlRoom() {
   }
   if (error && !dash) {
     return (
-      <div className="rounded-xl border border-red-200 bg-red-500/[0.04] p-5">
-        <p className="text-sm font-semibold text-red-600">Finance Control Room unavailable</p>
-        <p className="mt-1 text-xs text-stone-600">{error}</p>
-      </div>
+      <ProductErrorState
+        error={error}
+        onRetry={() => { setLoading(true); setError(null); load(); }}
+      />
     );
   }
 
@@ -221,6 +237,7 @@ export default function FinanceControlRoom() {
         <MetricCard label="False auto-resolve" value={run ? String(run.false_auto_resolve) : '—'} tone={run && run.false_auto_resolve > 0 ? 'bad' : 'good'} sub="must stay at 0" />
         <MetricCard label="Decision integrity" value={dash?.ledger_verified ? 'Verified' : 'Unknown'} tone={dash?.ledger_verified ? 'good' : 'default'} sub="hash chain from genesis" />
         <MetricCard label="Queue exposure" value={dash ? formatINR(dash.total_variance ?? 0) : '—'} tone={dash && (dash.total_variance ?? 0) !== 0 ? 'bad' : 'good'} sub="unresolved financial variance" />
+        <MetricCard label="AI investigated" value={dash?.total_cases ? `${(dash.ai_invocation_rate * 100).toFixed(1)}%` : '—'} tone={dash && dash.ai_invoked_cases > 0 ? 'default' : 'default'} sub={dash ? `${dash.ai_invoked_cases} of ${dash.total_cases} cases · ${(dash.deterministic_only_rate * 100).toFixed(0)}% AI-free (gated)` : 'demand-driven gate'} />
       </div>
 
       {/* ── Outcome distribution ── */}
@@ -239,6 +256,31 @@ export default function FinanceControlRoom() {
               </span>
             ))}
             <span className="ml-auto font-medium text-stone-400">out of {run.total_cases} cases in latest run</span>
+          </div>
+        </div>
+      )}
+
+      {/* ── Tier 1-7 coverage (real tier counts from case analysis) ── */}
+      {dash && dash.total_cases > 0 && Object.keys(dash.tier_counts ?? {}).length > 0 && (
+        <div className="surface px-4 py-3">
+          <div className="flex items-center justify-between">
+            <h2 className="section-label">Reconciliation Domains (Tier 1–7)</h2>
+            <span className="text-[10px] text-stone-500">cases analyzed across {Object.keys(dash.tier_counts).length} domains</span>
+          </div>
+          <div className="mt-2 grid grid-cols-2 gap-x-5 gap-y-1.5 sm:grid-cols-4 xl:grid-cols-7">
+            {Array.from({ length: 7 }, (_, i) => i + 1).map((t) => {
+              const count = dash.tier_counts[String(t)] ?? 0;
+              return (
+                <div key={t} className={`rounded-lg px-2.5 py-2 ring-1 ${count > 0 ? 'ring-black/[0.06] bg-white/60' : 'ring-black/[0.03] bg-transparent opacity-40'}`}>
+                  <div className="flex items-center gap-1.5">
+                    <span className={`h-1.5 w-1.5 rounded-full ${count > 0 ? TIER_DOT[t] : 'bg-stone-300'}`} />
+                    <span className="text-[9px] font-semibold uppercase tracking-wider text-stone-500">Tier {t}</span>
+                  </div>
+                  <p className="mt-0.5 text-[11px] font-medium text-stone-700">{TIER_LABELS[t]}</p>
+                  <p className="amount mt-0.5 text-xs font-bold text-stone-800">{count} <span className="font-normal text-stone-400">case{count === 1 ? '' : 's'}</span></p>
+                </div>
+              );
+            })}
           </div>
         </div>
       )}
@@ -372,6 +414,18 @@ export default function FinanceControlRoom() {
             <span className="font-mono text-[11px] text-stone-500">{selected.payment_id}</span>
           </div>
 
+          {(selected.tiers_applied?.length ?? 0) > 0 && (
+            <div className="flex flex-wrap items-center gap-1.5 border-b border-black/[0.05] px-4 py-2">
+              <span className="text-[9px] font-semibold uppercase tracking-wider text-stone-400">Domains</span>
+              {selected.tiers_applied!.map((t) => (
+                <span key={t} className="inline-flex items-center gap-1 rounded-full bg-white/70 px-2 py-0.5 text-[10px] font-medium text-stone-700 ring-1 ring-black/[0.06]">
+                  <span className={`h-1 w-1 rounded-full ${TIER_DOT[t]}`} />
+                  T{t} · {TIER_LABELS[t] ?? `Tier ${t}`}
+                </span>
+              ))}
+            </div>
+          )}
+
           <div className="grid gap-0 md:grid-cols-2">
             {/* Left: deterministic numbers */}
             <div className="p-5">
@@ -437,6 +491,11 @@ export default function FinanceControlRoom() {
               {selected.ai_technical_reason && (
                 <p className="mt-1 rounded border border-amber-200 bg-amber-500/[0.05] px-2.5 py-1.5 text-[10px] text-amber-700">{selected.ai_technical_reason}</p>
               )}
+              {!selected.ai_invoked && selected.ai_trigger_reason && (
+                <p className="mt-1 rounded border border-black/[0.06] bg-white/60 px-2.5 py-1.5 text-[10px] text-stone-600">
+                  AI not invoked — <span className="font-mono">{selected.ai_trigger_reason}</span>
+                </p>
+              )}
               {selected.ai_interpretation?.evidence_summary ? (
                 <p className="mt-2 text-xs leading-relaxed text-stone-700">{selected.ai_interpretation.evidence_summary as string}</p>
               ) : (
@@ -447,6 +506,26 @@ export default function FinanceControlRoom() {
                   <span className="font-medium text-stone-800">Discrepancy:</span> {String(selected.ai_interpretation.discrepancy_explanation)}
                 </p>
               ) : null}
+
+              <h3 className="section-label mb-2 mt-4">Tier Findings</h3>
+              {!selected.tier_findings || selected.tier_findings.length === 0 ? (
+                <p className="text-xs text-stone-500">No tier findings — deterministic engine verified this case cleanly.</p>
+              ) : (
+                <div className="space-y-2">
+                  {selected.tier_findings.map((f, i) => (
+                    <div key={i} className="rounded-lg border border-black/[0.06] bg-white/60 p-3 text-[11px]">
+                      <div className="mb-0.5 flex items-center justify-between">
+                        <span className="font-semibold text-stone-700">Tier {f.tier} · {f.tier_label}</span>
+                        <span className={`rounded-full px-1.5 py-0.5 text-[9px] font-semibold ${f.severity === 'exception' ? 'bg-red-500/10 text-red-700' : f.severity === 'review' ? 'bg-amber-500/10 text-amber-700' : 'bg-emerald-500/10 text-emerald-700'}`}>{f.code}</span>
+                      </div>
+                      <p className="text-stone-600">{f.explanation}</p>
+                      {f.evidence_refs.length > 0 && (
+                        <p className="mt-1 text-[10px] text-stone-500">evidence: {f.evidence_refs.join(', ')}</p>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              )}
 
               <h3 className="section-label mb-2 mt-4">Structured Exceptions</h3>
               {selected.exceptions.length === 0 ? (
@@ -494,6 +573,21 @@ export default function FinanceControlRoom() {
                   <span className="font-mono text-stone-600">{selected.related_record_ids.length}</span>
                 </div>
               </div>
+
+              {(selected.relationships?.length ?? 0) > 0 && (
+                <>
+                  <h3 className="section-label mb-2 mt-4">Evidence Graph</h3>
+                  <div className="space-y-1 text-[10px]">
+                    {selected.relationships!.map((rel, i) => (
+                      <div key={i} className="flex items-center gap-1.5 font-mono text-stone-600">
+                        <span className="text-stone-500">{rel.source}</span>
+                        <span className="text-violet-500">──{rel.relation}──▶</span>
+                        <span className="text-stone-700">{rel.target}</span>
+                      </div>
+                    ))}
+                  </div>
+                </>
+              )}
             </div>
           </div>
         </section>

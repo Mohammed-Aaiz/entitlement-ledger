@@ -106,6 +106,11 @@ export interface RazorpayEvent {
     evidence_quote: string;
   }>;
   linked_decision_id: string | null;
+  event_family?: string;
+  known_event?: boolean;
+  financial_relevance?: boolean;
+  affects_reconciliation?: boolean;
+  context_risk_only?: boolean;
 }
 
 export interface RazorpayStatus {
@@ -246,9 +251,12 @@ export interface ReconciliationCase {
   exception_codes: string[];
   exceptions: ReconciliationException[];
   ai_status: string;
+  ai_invoked: boolean;
   ai_confidence: number | null;
   ai_interpretation: Record<string, unknown>;
   ai_technical_reason: string;
+  ai_trigger_reason: string;
+  ai_tool_calls: number;
   calculation_trace: {
     captured_amount?: number;
     refund_total?: number;
@@ -266,6 +274,23 @@ export interface ReconciliationCase {
   decision_id: string;
   explanation: string;
   related_record_ids: string[];
+  // Tier 1-7 analysis + typed relationship graph (deterministic, real).
+  tiers_applied?: number[];
+  tier_findings?: Array<{
+    tier: number;
+    tier_label: string;
+    code: string;
+    severity: string;
+    explanation: string;
+    evidence_refs: string[];
+    detail: Record<string, unknown>;
+  }>;
+  relationships?: Array<{
+    source: string;
+    relation: string;
+    target: string;
+    evidence_refs: string[];
+  }>;
   created_at: string;
 }
 
@@ -278,7 +303,49 @@ export interface ReconciliationDashboard {
   exceptions: number;
   match_rate: number;
   total_variance: number;
+  // Real tier distribution across all cases (tier -> case count).
+  tier_counts: { [tier: string]: number };
+  ai_invoked_cases: number;
+  ai_invocation_rate: number;
+  deterministic_only_rate: number;
   unresolved_exceptions: ReconciliationCase[];
   false_auto_resolve_risk_cases: ReconciliationCase[];
   ledger_verified: boolean;
+}
+
+export interface SupportAnswer {
+  answer: string;
+  key_points: string[];
+  citations: string[];
+  insufficient_evidence: boolean;
+}
+
+export interface SupportAskResponse {
+  status: string;
+  mode: string;
+  answer: SupportAnswer;
+  technical_reason: string;
+  latency_ms: number;
+  provider: string;
+  model: string;
+  usage: {
+    invocations: number;
+    failures: number;
+    last_error: string;
+    last_latency_ms: number | null;
+  };
+}
+
+export interface SupportStatus {
+  provider: string;
+  available: boolean;
+  model: string;
+  error: string;
+  modes: { [mode: string]: string };
+  usage: {
+    invocations: number;
+    failures: number;
+    last_error: string;
+    last_latency_ms: number | null;
+  };
 }

@@ -22,6 +22,7 @@ import AnalyzeDecision from './pages/AnalyzeDecision';
 import Decisions from './pages/Decisions';
 import Login from './pages/Login';
 import FinanceControlRoom from './pages/FinanceControlRoom';
+import FinanceSupportCenter from './pages/FinanceSupportCenter';
 
 /* ─── Navigation items ─── */
 interface NavItem {
@@ -51,6 +52,7 @@ const NAV_SECTIONS: { title: string; items: NavItem[] }[] = [
     title: 'FINANCE',
     items: [
       { label: 'Finance Control Room', href: '/finance-control-room', icon: GoGraph },
+      { label: 'Support Center', href: '/finance-support-center', icon: GoGraph },
     ],
   },
   {
@@ -444,6 +446,7 @@ function AppShell() {
               <Route path="/scenarios" element={<Scenarios />} />
               <Route path="/razorpay" element={<RazorpayEvents />} />
               <Route path="/finance-control-room" element={<FinanceControlRoom />} />
+              <Route path="/finance-support-center" element={<FinanceSupportCenter />} />
             </Routes>
           </div>
         </main>

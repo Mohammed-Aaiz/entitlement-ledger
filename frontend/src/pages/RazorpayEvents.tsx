@@ -139,15 +139,23 @@ export default function RazorpayEvents() {
             Financial events from the payment gateway, ingested as provenance evidence — each event feeds the pipeline that backs settlement decisions.
           </p>
         </div>
-        {/* Integration status badge */}
+        {/* Integration status badge — mode is derived from the key prefix: test credentials are NEVER shown as LIVE MODE */}
         {status && (
           <span className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-semibold ${
             status.mode === 'live'
               ? 'border-[#4ADE80]/30 bg-emerald-500/[0.06] text-emerald-600'
-              : 'border-purple-300 bg-purple-600/[0.06] text-purple-600'
+              : status.mode === 'test'
+              ? 'border-amber-300 bg-amber-500/[0.06] text-amber-600'
+              : 'border-stone-200 bg-white/50 text-stone-500'
           }`}>
-            <span className={`h-1.5 w-1.5 rounded-full ${status.mode === 'live' ? 'bg-emerald-500' : 'bg-purple-600'}`} />
-            {status.mode === 'live' ? 'LIVE MODE' : 'DEMO MODE'}
+            <span className={`h-1.5 w-1.5 rounded-full ${
+              status.mode === 'live' ? 'bg-emerald-500'
+              : status.mode === 'test' ? 'bg-amber-500'
+              : 'bg-stone-400'
+            }`} />
+            {status.mode === 'live' ? 'LIVE MODE'
+              : status.mode === 'test' ? 'TEST MODE'
+              : 'NOT CONFIGURED'}
             {status.key_id_preview && <span className="ml-1 font-mono text-[10px] opacity-70">{status.key_id_preview}</span>}
           </span>
         )}
@@ -156,12 +164,17 @@ export default function RazorpayEvents() {
       {/* ── Connection status ── */}
       {connection && (
         <div className="surface flex items-center gap-3 p-4">
-          <span className={`h-2 w-2 shrink-0 rounded-full ${connection.configured ? 'bg-emerald-500' : 'bg-purple-600'}`} />
+          <span className={`h-2 w-2 shrink-0 rounded-full ${
+            connection.configured ? (connection.mode === 'test' ? 'bg-amber-500' : 'bg-emerald-500') : 'bg-stone-400'
+          }`} />
           <p className="text-xs">
             {connection.configured ? (
               <>
-                <span className="capitalize text-stone-800">{connection.mode} mode</span>
+                <span className="capitalize text-stone-800">{connection.mode === 'test' ? 'Test' : connection.mode} mode</span>
                 <span className="ml-2 font-mono text-stone-500">{connection.key_id_preview}</span>
+                {connection.mode === 'test' && (
+                  <span className="ml-2 text-amber-600">Test-mode credentials — not live payments</span>
+                )}
                 {connection.webhook_secret_present && (
                   <span className="ml-2 text-emerald-600">Webhook signature verification enabled</span>
                 )}

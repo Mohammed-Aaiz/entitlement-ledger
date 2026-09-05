@@ -282,10 +282,25 @@ export default function DecisionDetail() {
   const adj = gross - decision.final_amount;
   const policyMap = Object.fromEntries(policies.map((p) => [p.policy_id, p]));
 
-  // Surface AI model output fields
+  // Surface AI model output fields — reconciliation decisions carry the
+  // structured interpretation; anything else (legacy reasoning prose) is
+  // intentionally not surfaced.
   const modelOutput = decision.model_output as Record<string, unknown> | undefined;
-  const aiConfidence = modelOutput?.confidence;
-  const aiReasoning = modelOutput?.reasoning_summary || modelOutput?.reasoning;
+  const recon = (modelOutput?.reconciliation ?? null) as Record<string, unknown> | null;
+  const calcTrace = (modelOutput?.calculation_trace ?? null) as Record<string, unknown> | null;
+  const aiInterpretation = (modelOutput?.ai_interpretation ?? null) as Record<string, unknown> | null;
+  const aiStatus = typeof modelOutput?.ai_status === 'string' ? (modelOutput.ai_status as string) : null;
+  const aiInvoked = modelOutput?.ai_invoked === true;
+  const aiTriggerReason = typeof modelOutput?.ai_trigger_reason === 'string' ? (modelOutput.ai_trigger_reason as string) : '';
+  const aiTechnicalReason = typeof modelOutput?.ai_technical_reason === 'string' ? (modelOutput.ai_technical_reason as string) : '';
+  const aiToolCalls = typeof modelOutput?.ai_tool_calls === 'number' ? (modelOutput.ai_tool_calls as number) : 0;
+  const aiEvidenceIds = Array.isArray(aiInterpretation?.evidence_ids) ? (aiInterpretation!.evidence_ids as string[]) : [];
+  const aiRootCauses = Array.isArray(aiInterpretation?.root_cause_candidates) ? (aiInterpretation!.root_cause_candidates as Array<{ cause: string; confidence: number; reasoning?: string }>) : [];
+  const aiContradictions = Array.isArray(aiInterpretation?.contradictions) ? (aiInterpretation!.contradictions as Array<{ between: string[]; description: string }>) : [];
+  const aiRelations = Array.isArray(aiInterpretation?.identified_relations) ? (aiInterpretation!.identified_relations as Array<{ record_ref: string; relation: string }>) : [];
+  const aiAmbiguous = aiInterpretation?.ambiguous === true;
+  const aiReviewSuggested = aiInterpretation?.suggested_human_review === true;
+  const showAiSection = aiStatus === 'available' && aiInterpretation !== null && Object.keys(aiInterpretation).length > 0;
 
   // Open slide-over panel
   const openItem = selectedItem !== null ? decision.line_items[selectedItem] : null;
@@ -443,39 +458,162 @@ export default function DecisionDetail() {
             </div>
           </section>
 
-          {/* AI Reasoning — surface confidence + reasoning_summary */}
-          {modelOutput && Object.keys(modelOutput).length > 0 && (
+          {/* AI Evidence Interpretation — structured, only when AI was actually invoked */}
+          {showAiSection && (
             <section className="surface p-5">
-              <h2 className="section-label mb-3">AI Reasoning & Provenance</h2>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h2 className="section-label">AI Evidence Interpretation</h2>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-purple-500/20 bg-purple-600/[0.04] px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-purple-600">
+                  <span className="h-1.5 w-1.5 rounded-full bg-purple-600" />
+                  Evidence interpretation only
+                </span>
+              </div>
 
-              {typeof aiConfidence === 'number' && (
-                <div className="mb-3 rounded-lg border border-purple-500/20 bg-purple-600/[0.04] px-4 py-3">
-                  <p className="text-[10px] uppercase tracking-wider text-stone-500">Model Confidence</p>
-                  <div className="mt-1 flex items-baseline gap-2">
-                    <span className="amount text-xl font-bold text-purple-600">{Math.round((aiConfidence as number) * 100)}%</span>
-                    <span className="text-[10px] text-stone-600">confidence in classification</span>
+              {typeof aiInterpretation?.discrepancy_explanation === 'string' && aiInterpretation.discrepancy_explanation !== '' && (
+                <div className="mt-3 rounded-lg border border-[var(--border)] bg-white/50 p-4">
+                  <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Finding</p>
+                  <p className="text-[11px] leading-relaxed text-stone-600">{aiInterpretation.discrepancy_explanation as string}</p>
+                </div>
+              )}
+              {typeof aiInterpretation?.evidence_summary === 'string' && aiInterpretation.evidence_summary !== '' && (
+                <p className="mt-2 text-[11px] leading-relaxed text-stone-600">{aiInterpretation.evidence_summary as string}</p>
+              )}
+
+              <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                {typeof aiInterpretation?.confidence === 'number' && (
+                  <div className="rounded-lg border border-purple-500/20 bg-purple-600/[0.04] px-4 py-3">
+                    <p className="text-[10px] uppercase tracking-wider text-stone-500">Interpretation confidence</p>
+                    <p className="amount mt-1 text-xl font-bold text-purple-600">{Math.round((aiInterpretation.confidence as number) * 100)}%</p>
+                    <p className="mt-0.5 text-[9px] italic text-stone-500">Confidence in the AI's interpretation — never financial correctness or approval probability.</p>
+                  </div>
+                )}
+                <div className="rounded-lg border border-[var(--border)] bg-white/50 px-4 py-3">
+                  <p className="text-[10px] uppercase tracking-wider text-stone-500">Ambiguity</p>
+                  <p className="mt-1 text-xs font-medium text-stone-700">
+                    {aiAmbiguous ? 'Ambiguous — human review recommended' : 'No unresolved ambiguity identified'}
+                  </p>
+                  {aiReviewSuggested && (
+                    <p className="mt-1 text-[10px] text-amber-600">AI recommends human review of this case.</p>
+                  )}
+                </div>
+              </div>
+
+              {aiRootCauses.length > 0 && (
+                <div className="mt-3">
+                  <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-1.5">Advisory root-cause candidates</p>
+                  <div className="flex flex-wrap gap-2">
+                    {aiRootCauses.map((rc, i) => (
+                      <span key={i} className="inline-flex items-center gap-1.5 rounded-full border border-[var(--border)] bg-white/60 px-2 py-0.5 text-[10px] text-stone-700">
+                        {rc.cause.replace(/_/g, ' ')}
+                        <span className="font-mono text-[9px] text-stone-500">{Math.round(rc.confidence * 100)}%</span>
+                      </span>
+                    ))}
                   </div>
                 </div>
               )}
 
-              {typeof aiReasoning === 'string' && (
-                <div className="mb-3 rounded-lg border border-[var(--border)] bg-white/50 p-4">
-                  <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-1">Reasoning Summary</p>
-                  <p className="text-[11px] leading-relaxed text-stone-600">{aiReasoning}</p>
+              {aiContradictions.length > 0 && (
+                <div className="mt-3">
+                  <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-1.5">Contradictions flagged</p>
+                  <div className="space-y-1.5">
+                    {aiContradictions.map((c, i) => (
+                      <p key={i} className="text-[11px] text-stone-600">
+                        <span className="font-mono text-stone-500">{c.between.join(', ')}</span> — {c.description}
+                      </p>
+                    ))}
+                  </div>
                 </div>
               )}
 
-              <details>
-                <summary className="cursor-pointer text-[10px] font-medium text-stone-600 hover:text-purple-600">
-                  Full model output ▾
-                </summary>
-                <pre className="mt-2 overflow-x-auto rounded-lg border border-[var(--border)] bg-white/50 p-4 font-mono text-[10px] leading-relaxed text-stone-600">
-                  {JSON.stringify(modelOutput, null, 2)}
-                </pre>
-              </details>
-              <p className="mt-2 text-[10px] italic text-stone-500">
-                AI extracts facts and claims; financial amounts are calculated deterministically.
-              </p>
+              {aiRelations.length > 0 && (
+                <div className="mt-3">
+                  <p className="text-[10px] uppercase tracking-wider text-stone-500 mb-1.5">Identified relationships</p>
+                  <div className="flex flex-wrap gap-2">
+                    {aiRelations.map((r, i) => (
+                      <span key={i} className="rounded-lg border border-[var(--border)] bg-white/60 px-2 py-1 font-mono text-[10px] text-stone-600">
+                        {r.relation} → {r.record_ref}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="mt-3 flex flex-wrap items-center gap-2 text-[9px] text-stone-500">
+                {aiEvidenceIds.length > 0 && (
+                  <span className="font-mono">Evidence: {aiEvidenceIds.join(', ')}</span>
+                )}
+                {aiToolCalls > 0 && (
+                  <span className="font-mono">Read-only investigation: {aiToolCalls} tool call{aiToolCalls === 1 ? '' : 's'}</span>
+                )}
+                <span>AI role: evidence interpretation only — it never decides financial values.</span>
+              </div>
+            </section>
+          )}
+
+          {/* Deterministic Financial Calculation — always shown for reconciliation decisions */}
+          {recon !== null && calcTrace !== null && (
+            <section className="surface p-5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <h2 className="section-label">Financial Calculation</h2>
+                <span className="inline-flex items-center gap-1.5 rounded-full border border-emerald-500/20 bg-emerald-500/[0.05] px-2 py-0.5 text-[9px] font-semibold uppercase tracking-wider text-emerald-600">
+                  Deterministic reconciliation engine
+                </span>
+              </div>
+              <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-3">
+                <div className="col-span-2 sm:col-span-3 border-b border-black/[0.05] pb-2 flex items-baseline justify-between">
+                  <dt className="text-[10px] uppercase tracking-wider text-stone-500">Captured amount</dt>
+                  <dd className="amount text-sm font-semibold text-stone-800">{formatINR((calcTrace.captured_amount as number) ?? 0)}</dd>
+                </div>
+                {calcTrace.refund_total !== undefined && calcTrace.refund_total !== 0 && (
+                  <div className="flex items-baseline justify-between">
+                    <dt className="text-[10px] uppercase tracking-wider text-stone-500">Refunds</dt>
+                    <dd className="amount text-xs text-stone-700">−{formatINR(calcTrace.refund_total as number)}</dd>
+                  </div>
+                )}
+                {calcTrace.fee_total !== undefined && calcTrace.fee_total !== 0 && (
+                  <div className="flex items-baseline justify-between">
+                    <dt className="text-[10px] uppercase tracking-wider text-stone-500">Fees</dt>
+                    <dd className="amount text-xs text-stone-700">−{formatINR(calcTrace.fee_total as number)}</dd>
+                  </div>
+                )}
+                {calcTrace.tax_total !== undefined && calcTrace.tax_total !== 0 && (
+                  <div className="flex items-baseline justify-between">
+                    <dt className="text-[10px] uppercase tracking-wider text-stone-500">Taxes</dt>
+                    <dd className="amount text-xs text-stone-700">−{formatINR(calcTrace.tax_total as number)}</dd>
+                  </div>
+                )}
+                {calcTrace.adjustments !== undefined && calcTrace.adjustments !== 0 && (
+                  <div className="flex items-baseline justify-between">
+                    <dt className="text-[10px] uppercase tracking-wider text-stone-500">Adjustments</dt>
+                    <dd className="amount text-xs text-stone-700">{formatINR(Math.abs(calcTrace.adjustments as number))}</dd>
+                  </div>
+                )}
+                <div className="flex items-baseline justify-between">
+                  <dt className="text-[10px] uppercase tracking-wider text-stone-500">Expected settlement</dt>
+                  <dd className="amount text-sm font-semibold text-stone-800">{formatINR((calcTrace.expected_settlement as number) ?? 0)}</dd>
+                </div>
+                <div className="flex items-baseline justify-between">
+                  <dt className="text-[10px] uppercase tracking-wider text-stone-500">Actual settlement</dt>
+                  <dd className="amount text-sm font-semibold text-stone-800">
+                    {calcTrace.actual_settlement == null ? '—' : formatINR(calcTrace.actual_settlement as number)}
+                  </dd>
+                </div>
+                <div className="flex items-baseline justify-between">
+                  <dt className="text-[10px] uppercase tracking-wider text-stone-500">Variance</dt>
+                  <dd className={`amount text-sm font-semibold ${(calcTrace.variance ?? 0) === 0 ? 'text-emerald-600' : 'text-amber-600'}`}>
+                    {calcTrace.variance == null ? '—' : formatINR(calcTrace.variance as number)}
+                  </dd>
+                </div>
+              </dl>
+
+              <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-black/[0.05] pt-3 text-[9px] text-stone-500">
+                <span>
+                  AI invoked: <span className="font-medium">{aiInvoked ? 'yes' : 'no'}</span>
+                </span>
+                {aiTriggerReason !== '' && <span className="font-mono">{aiTriggerReason}</span>}
+                {!aiInvoked && aiTechnicalReason !== '' && <span className="font-mono text-red-600/70">{aiTechnicalReason}</span>}
+                <span className="ml-auto">All amounts in integer paise — computed by deterministic code, never by AI.</span>
+              </div>
             </section>
           )}
         </div>
