@@ -367,10 +367,20 @@ async def run_scenario(scenario_id: str, user: CurrentUser = Depends(get_current
                 },
             )
 
-        # Get previous decision hash from database (not seed data)
+        # Get previous decision hash from database (not seed data).
+        # The TRUE chain tail is the decision whose hash is not referenced
+        # as any other decision's prev_decision_hash — ordering by
+        # created_at alone is unreliable (microsecond ties are common).
         cursor_hash = await db.execute(
-            "SELECT decision_hash FROM decisions WHERE tenant_id = ? AND decision_id != 'dec_005_tampered' "
-            "ORDER BY created_at DESC LIMIT 1",
+            "SELECT d.decision_hash FROM decisions d "
+            "WHERE d.tenant_id = ? AND d.decision_id != 'dec_005_tampered' "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM decisions o "
+            "  WHERE o.tenant_id = d.tenant_id "
+            "    AND o.prev_decision_hash = d.decision_hash "
+            "    AND o.decision_id != 'dec_005_tampered'"
+            ") "
+            "ORDER BY d.created_at DESC, d.decision_hash DESC LIMIT 1",
             (user.tenant_id,),
         )
         prev_row = await cursor_hash.fetchone()
@@ -1350,10 +1360,19 @@ async def analyze_decision(
         )
         final_amount = calculate_final_amount(req.gross_amount, line_items)
 
-        # 3. Get previous hash for chain
+        # 3. Get previous hash for chain — the TRUE tail is the decision
+        # whose hash is not referenced as any other decision's
+        # prev_decision_hash (created_at ordering ties are unreliable).
         cursor = await db.execute(
-            "SELECT decision_hash FROM decisions WHERE tenant_id = ? AND decision_id != 'dec_005_tampered' "
-            "ORDER BY created_at DESC LIMIT 1",
+            "SELECT d.decision_hash FROM decisions d "
+            "WHERE d.tenant_id = ? AND d.decision_id != 'dec_005_tampered' "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM decisions o "
+            "  WHERE o.tenant_id = d.tenant_id "
+            "    AND o.prev_decision_hash = d.decision_hash "
+            "    AND o.decision_id != 'dec_005_tampered'"
+            ") "
+            "ORDER BY d.created_at DESC, d.decision_hash DESC LIMIT 1",
             (user.tenant_id,),
         )
         prev_row = await cursor.fetchone()

@@ -33,6 +33,23 @@ class ExceptionCode(str, enum.Enum):
     AI_UNAVAILABLE = "AI_UNAVAILABLE"
     INVALID_RECORD = "INVALID_RECORD"
     UNRESOLVED_RECONCILIATION = "UNRESOLVED_RECONCILIATION"
+    # Tier 5-7 deterministic escalation codes (context-driven review).
+    DISPUTE_OPEN = "DISPUTE_OPEN"
+    PARTIAL_PAYMENT = "PARTIAL_PAYMENT"
+    OVERPAYMENT = "OVERPAYMENT"
+    UNLINKED_SETTLEMENT = "UNLINKED_SETTLEMENT"
+    # First-class invalid-financial-evidence codes.  These are deterministic
+    # outcomes for source data that violates a financial invariant (never
+    # AI-repaired, never silently absorbed).
+    INVALID_REFUND_TOTAL = "INVALID_REFUND_TOTAL"
+    INVALID_REFUND_AMOUNT = "INVALID_REFUND_AMOUNT"
+    INVALID_CAPTURED_AMOUNT = "INVALID_CAPTURED_AMOUNT"
+    INVALID_FEE_AMOUNT = "INVALID_FEE_AMOUNT"
+    INVALID_TAX_AMOUNT = "INVALID_TAX_AMOUNT"
+    INVALID_SETTLEMENT_AMOUNT = "INVALID_SETTLEMENT_AMOUNT"
+    INVALID_FINANCIAL_RECORD = "INVALID_FINANCIAL_RECORD"
+    CALCULATION_ERROR = "CALCULATION_ERROR"
+    CONTRADICTORY_FINANCIAL_EVIDENCE = "CONTRADICTORY_FINANCIAL_EVIDENCE"
 
 
 ALL_EXCEPTION_CODES = {code.value for code in ExceptionCode}
@@ -321,6 +338,93 @@ def invalid_record(
     )
 
 
+def invalid_refund_total(
+    payment_id: str,
+    captured: int,
+    refund_total: int,
+    involved_records: list[str],
+    evidence_refs: list[str],
+) -> ReconciliationException:
+    """Refunds exceed the captured amount — impossible source data.
+
+    total_refunds <= captured_amount is a hard financial invariant.  The
+    exception preserves the exact recorded values and explains the
+    violation deterministically.  AI must never "repair" these amounts.
+    """
+    return ReconciliationException(
+        code=ExceptionCode.INVALID_REFUND_TOTAL.value,
+        explanation=(
+            f"Invalid refund total for payment {payment_id}: refund records "
+            f"total {refund_total} paise but captured amount is only {captured} "
+            "paise. Refunds cannot exceed the captured amount; the source "
+            "evidence is invalid and requires correction at the source."
+        ),
+        involved_record_ids=involved_records,
+        financial_impact=captured - refund_total,
+        evidence_refs=evidence_refs,
+        human_action_required=True,
+    )
+
+
+def invalid_amount(
+    code: str,
+    payment_id: str,
+    field_name: str,
+    value: int,
+    involved_records: list[str],
+    evidence_refs: list[str],
+) -> ReconciliationException:
+    """A recorded financial amount violates a per-field invariant."""
+    return ReconciliationException(
+        code=code,
+        explanation=(
+            f"Invalid {field_name} for payment {payment_id}: recorded value "
+            f"{value} paise is not a valid non-negative amount. The source "
+            "evidence is invalid and requires correction at the source."
+        ),
+        involved_record_ids=involved_records,
+        evidence_refs=evidence_refs,
+        human_action_required=True,
+    )
+
+
+def calculation_error(
+    payment_id: str,
+    detail: str,
+    involved_records: list[str],
+    evidence_refs: list[str],
+) -> ReconciliationException:
+    """A deterministic calculation could not complete on the supplied evidence."""
+    return ReconciliationException(
+        code=ExceptionCode.CALCULATION_ERROR.value,
+        explanation=(
+            f"Deterministic financial calculation failed for payment "
+            f"{payment_id}: {detail}"
+        ),
+        involved_record_ids=involved_records,
+        evidence_refs=evidence_refs,
+        human_action_required=True,
+    )
+
+
+def contradictory_financial_evidence(
+    payment_id: str,
+    detail: str,
+    involved_records: list[str],
+    evidence_refs: list[str],
+) -> ReconciliationException:
+    """Source evidence is internally contradictory and cannot be reconciled."""
+    return ReconciliationException(
+        code=ExceptionCode.CONTRADICTORY_FINANCIAL_EVIDENCE.value,
+        explanation=(
+            f"Contradictory financial evidence for payment {payment_id}: {detail}"
+        ),
+        involved_record_ids=involved_records,
+        evidence_refs=evidence_refs,
+        human_action_required=True,
+    )
+
+
 def unresolved_reconciliation(
     payment_id: str,
     detail: str,
@@ -332,6 +436,99 @@ def unresolved_reconciliation(
         explanation=(
             f"Reconciliation for payment {payment_id} could not be resolved "
             f"deterministically: {detail}"
+        ),
+        involved_record_ids=involved_records,
+        evidence_refs=evidence_refs,
+        human_action_required=True,
+    )
+
+
+def open_dispute(
+    payment_id: str,
+    involved_records: list[str],
+    evidence_refs: list[str],
+    status: str = "created",
+) -> ReconciliationException:
+    """Tier 5 — an open dispute is attached to the payment's case.
+
+    Risk/context only: the dispute does NOT change settlement arithmetic.
+    When financial evidence otherwise reconciles, an open dispute escalates
+    the case to REVIEW so a human can judge the chargeback risk.
+    """
+    return ReconciliationException(
+        code=ExceptionCode.DISPUTE_OPEN.value,
+        explanation=(
+            f"Payment {payment_id} has an open dispute (status '{status}'). "
+            "The dispute is recorded as risk context and does not alter "
+            "the deterministic settlement calculation, but the case requires "
+            "human review before it is treated as fully resolved."
+        ),
+        involved_record_ids=involved_records,
+        evidence_refs=evidence_refs,
+        human_action_required=True,
+    )
+
+
+def partial_payment(
+    payment_id: str,
+    expected: int,
+    actual: int,
+    involved_records: list[str],
+    evidence_refs: list[str],
+) -> ReconciliationException:
+    """Tier 6 — invoice/payment-link obligation paid only partially."""
+    return ReconciliationException(
+        code=ExceptionCode.PARTIAL_PAYMENT.value,
+        explanation=(
+            f"Obligation for payment {payment_id} is only partially paid: "
+            f"expected {expected} paise, received {actual} paise across the "
+            "related payments. Review required."
+        ),
+        involved_record_ids=involved_records,
+        financial_impact=expected - actual,
+        evidence_refs=evidence_refs,
+        human_action_required=True,
+    )
+
+
+def overpayment(
+    payment_id: str,
+    expected: int,
+    actual: int,
+    involved_records: list[str],
+    evidence_refs: list[str],
+) -> ReconciliationException:
+    """Tier 6 — payments received exceed the invoiced/linked obligation."""
+    return ReconciliationException(
+        code=ExceptionCode.OVERPAYMENT.value,
+        explanation=(
+            f"Payments totalling {actual} paise exceed the linked obligation "
+            f"of {expected} paise for payment {payment_id}. Review required."
+        ),
+        involved_record_ids=involved_records,
+        financial_impact=actual - expected,
+        evidence_refs=evidence_refs,
+        human_action_required=True,
+    )
+
+
+def unlinked_settlement(
+    settlement_id: str,
+    involved_records: list[str],
+    evidence_refs: list[str],
+) -> ReconciliationException:
+    """Tier 3 — a settlement cannot be deterministically linked to a payment.
+
+    The settlement is preserved as evidence and routed to review — a
+    relationship is never guessed.
+    """
+    return ReconciliationException(
+        code=ExceptionCode.UNLINKED_SETTLEMENT.value,
+        explanation=(
+            f"Settlement {settlement_id} cannot be deterministically linked "
+            "to any payment through supported identifiers (payment_id/order_id/"
+            "settlement recon). The settlement is preserved as evidence and "
+            "must be mapped manually."
         ),
         involved_record_ids=involved_records,
         evidence_refs=evidence_refs,

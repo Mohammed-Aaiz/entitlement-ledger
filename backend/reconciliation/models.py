@@ -19,6 +19,15 @@ RECORD_REFUND = "refund"
 RECORD_SETTLEMENT = "settlement"
 RECORD_FEE_TAX = "fee_tax"
 RECORD_ADJUSTMENT = "adjustment"
+# Tier 5-7 context record types (non-monetary evidence).  These records
+# NEVER enter the deterministic financial calculation — the calculator
+# only reads payment/refund/settlement/fee_tax/adjustment amounts.  They
+# exist to give disputes, invoices, payment links, and operational events
+# a real, evidence-backed place in a reconciliation case.
+RECORD_DISPUTE = "dispute"
+RECORD_INVOICE = "invoice"
+RECORD_PAYMENT_LINK = "payment_link"
+RECORD_OPERATIONAL = "operational"
 
 ALL_RECORD_TYPES = {
     RECORD_PAYMENT,
@@ -26,6 +35,31 @@ ALL_RECORD_TYPES = {
     RECORD_SETTLEMENT,
     RECORD_FEE_TAX,
     RECORD_ADJUSTMENT,
+    RECORD_DISPUTE,
+    RECORD_INVOICE,
+    RECORD_PAYMENT_LINK,
+    RECORD_OPERATIONAL,
+}
+
+# Context (non-financial-calculation) record types — matched into the case
+# for tier analysis but never summed by the calculator.
+CONTEXT_RECORD_TYPES = {
+    RECORD_DISPUTE,
+    RECORD_INVOICE,
+    RECORD_PAYMENT_LINK,
+    RECORD_OPERATIONAL,
+}
+
+# Reconciliation tiers a record type participates in.
+RECORD_TIER = {
+    RECORD_PAYMENT: 1,
+    RECORD_REFUND: 2,
+    RECORD_SETTLEMENT: 3,
+    RECORD_FEE_TAX: 4,
+    RECORD_DISPUTE: 5,
+    RECORD_INVOICE: 6,
+    RECORD_PAYMENT_LINK: 6,
+    RECORD_OPERATIONAL: 7,
 }
 
 # Classification outcomes (top-level decision gate results)
@@ -142,14 +176,22 @@ class ReconciliationCase:
     exception_codes: list[str] = field(default_factory=list)
     exceptions: list[dict] = field(default_factory=list)
     ai_status: str = AI_NOT_ATTEMPTED
+    ai_invoked: bool = False
     ai_confidence: Optional[float] = None
     ai_interpretation: dict = field(default_factory=dict)
     ai_technical_reason: str = ""
+    ai_trigger_reason: str = ""
+    ai_tool_calls: int = 0
     calculation_trace: dict = field(default_factory=dict)
     match_info: dict = field(default_factory=dict)
     decision_id: str = ""
     explanation: str = ""
     records: list[FinancialRecord] = field(default_factory=list)
+    # Tier 1-7 findings attached to this case (structured, deterministic).
+    tier_findings: list[dict] = field(default_factory=list)
+    tiers_applied: list[int] = field(default_factory=list)
+    # Typed, evidence-backed relationships reconstructed for this case.
+    relationships: list[dict] = field(default_factory=list)
     case_id: str = ""
     created_at: str = ""
 
@@ -171,15 +213,21 @@ class ReconciliationCase:
             "exception_codes": list(self.exception_codes),
             "exceptions": list(self.exceptions),
             "ai_status": self.ai_status,
+            "ai_invoked": self.ai_invoked,
             "ai_confidence": self.ai_confidence,
             "ai_interpretation": self.ai_interpretation,
             "ai_technical_reason": self.ai_technical_reason,
+            "ai_trigger_reason": self.ai_trigger_reason,
+            "ai_tool_calls": self.ai_tool_calls,
             "calculation_trace": self.calculation_trace,
             "match_info": self.match_info,
             "decision_id": self.decision_id,
             "explanation": self.explanation,
             "created_at": self.created_at,
             "related_record_ids": [r.record_id for r in self.records],
+            "tier_findings": list(self.tier_findings),
+            "tiers_applied": sorted(set(self.tiers_applied)),
+            "relationships": list(self.relationships),
         }
 
     def to_storage_dict(self) -> dict:

@@ -19,7 +19,8 @@ from pathlib import Path
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -270,8 +271,14 @@ app.add_middleware(
 async def log_requests(request: Request, call_next):
     """Structured request logging with request IDs and timing."""
     request_id = str(uuid.uuid4())[:12]
+    # Preserve the id for error envelopes raised below this middleware.
+    request.state.request_id = request_id
     start = time.time()
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        # Let the exception handlers produce the response — but still log.
+        raise
     duration_ms = int((time.time() - start) * 1000)
     if request.url.path.startswith("/api/"):
         # Never log request bodies (may contain secrets)
@@ -292,11 +299,126 @@ async def log_requests(request: Request, call_next):
     return response
 
 
+# ---------------------------------------------------------------------------
+# Consistent API error envelope
+# ---------------------------------------------------------------------------
+# Every error response carries BOTH the legacy top-level "detail" (kept for
+# backward compatibility with existing clients/tests) and a structured
+# "error" envelope: { code, message, request_id, retryable }.  Stack traces,
+# SQL, provider secrets and environment values are NEVER included.
+
+_RETRYABLE_STATUS = {408, 425, 429, 500, 502, 503, 504}
+
+_STATUS_CODES = {
+    400: "INVALID_REQUEST",
+    401: "UNAUTHORIZED",
+    403: "FORBIDDEN",
+    404: "NOT_FOUND",
+    405: "METHOD_NOT_ALLOWED",
+    409: "CONFLICT",
+    413: "PAYLOAD_TOO_LARGE",
+    422: "VALIDATION_ERROR",
+    429: "RATE_LIMITED",
+    500: "INTERNAL_ERROR",
+    502: "UPSTREAM_ERROR",
+    503: "SERVICE_UNAVAILABLE",
+    504: "GATEWAY_TIMEOUT",
+}
+
+
+def _error_body(request: Request, status_code: int, message: str, code: str = "") -> dict:
+    request_id = getattr(request.state, "request_id", "") or str(uuid.uuid4())[:12]
+    return {
+        # Legacy field — existing frontend clients read err.detail.
+        "detail": message,
+        "error": {
+            "code": code or _STATUS_CODES.get(status_code, f"HTTP_{status_code}"),
+            "message": message,
+            "request_id": request_id,
+            "retryable": status_code in _RETRYABLE_STATUS,
+        },
+    }
+
+
+def _public_message(status_code: int, exc: Exception) -> str:
+    """Map an exception to a safe, user-presentable message.
+
+    Never expose internals (SQL, provider bodies, env, stack).  HTTP
+    exceptions already carry safe messages; everything else is generic.
+    """
+    if isinstance(exc, HTTPException):
+        detail = exc.detail
+        return detail if isinstance(detail, str) and detail else "Request failed"
+    return "Internal server error"
+
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    # Legacy routes raise HTTPException with STRUCTURED dict details (e.g.
+    # {"status": "error", "error": ..., "message": ...}) that existing
+    # clients/tests read under top-level "detail".  Application-authored dict
+    # details are safe to pass through verbatim (never exception internals);
+    # string details become the envelope message as before.  Both shapes also
+    # receive the structured "error" envelope for new clients.
+    if isinstance(exc.detail, dict):
+        body = exc.detail
+        safe_msg = str(body.get("message") or body.get("error") or "Request failed")
+        logger.warning(
+            "[rid=%s] %s %s -> HTTP %s: %s",
+            getattr(request.state, "request_id", "-"), request.method, request.url.path,
+            exc.status_code, safe_msg,
+        )
+        envelope = _error_body(request, exc.status_code, safe_msg)
+        content = {"detail": body, "error": envelope["error"]}
+    else:
+        message = _public_message(exc.status_code, exc)
+        logger.warning(
+            "[rid=%s] %s %s -> HTTP %s: %s",
+            getattr(request.state, "request_id", "-"), request.method, request.url.path,
+            exc.status_code, message,
+        )
+        content = _error_body(request, exc.status_code, message)
+    return JSONResponse(
+        status_code=exc.status_code,
+        content=content,
+        headers=exc.headers,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Concise first error for users; the full list stays in server logs only.
+    first = None
+    try:
+        errs = exc.errors()
+        if errs:
+            loc = ".".join(str(p) for p in errs[0].get("loc", []) if p not in ("body", "query", "path"))
+            first = f"Invalid request: {loc}: {errs[0].get('msg', 'invalid value')}" if loc else \
+                f"Invalid request: {errs[0].get('msg', 'invalid value')}"
+    except Exception:  # pragma: no cover — defensive
+        first = "Invalid request"
+    logger.warning(
+        "[rid=%s] %s %s -> 422: %s",
+        getattr(request.state, "request_id", "-"), request.method, request.url.path, first,
+    )
+    return JSONResponse(
+        status_code=422,
+        content=_error_body(request, 422, first or "Invalid request"),
+    )
+
+
 # Global error handler — never expose stack traces or secrets to clients
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    logger.error("Unhandled exception: %s %s: %s", request.method, request.url.path, exc, exc_info=True)
-    return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+    request_id = getattr(request.state, "request_id", "-")
+    logger.error(
+        "[rid=%s] Unhandled exception %s %s: %s",
+        request_id, request.method, request.url.path, exc, exc_info=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content=_error_body(request, 500, "Internal server error"),
+    )
 
 
 # Import and mount routers
@@ -304,11 +426,13 @@ from routes import router
 from razorpay_routes import router as razorpay_router
 from auth_routes import router as auth_router
 from reconciliation.routes import router as reconciliation_router
+from reconciliation.support_routes import router as support_router
 
 app.include_router(auth_router, prefix="/api/auth", tags=["auth"])
 app.include_router(router, prefix="/api")
 app.include_router(razorpay_router, prefix="/api")
 app.include_router(reconciliation_router, prefix="/api", tags=["reconciliation"])
+app.include_router(support_router, prefix="/api", tags=["support"])
 
 
 @app.get("/")

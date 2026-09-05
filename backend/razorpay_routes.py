@@ -16,6 +16,7 @@ from pydantic import BaseModel
 
 import razorpay_client
 import razorpay_events
+import razorpay_registry
 from auth import CurrentUser, get_current_user
 from database import get_db, log_audit
 from models import RazorpayEventResponse, RazorpayConnectionInfo
@@ -33,6 +34,65 @@ SUPPORTED_EVENT_TYPES = {
     "payment.authorized", "payment.captured", "payment.failed",
     "order.paid", "refund.created", "refund.processed", "settlement.processed",
 }
+
+
+def _safe_int(value) -> int:
+    """Coerce a Razorpay recon numeric field to int (paise), never raising."""
+    try:
+        if value is None:
+            return 0
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _recon_rows_from_payload(settlement_id: str, payload: dict) -> list[dict]:
+    """Extract deterministic settlement↔payment linkage rows from a Razorpay
+    settlement recon response.
+
+    Both the single-settlement recon (``GET /settlements/{id}/recon``) and
+    the combined recon (``GET /settlements/recon/combined``) return a
+    ``collection`` whose items carry: ``type``/``entity``, ``entity_id``,
+    ``payment_id``, ``order_id``, ``amount``, ``fee``, ``tax``.
+
+    Only financially meaningful, linkable rows are kept:
+    - ``payment`` items link a settlement to the payment via ``entity_id``.
+    - ``refund`` items link a settlement to the refunded payment.
+    - transfer/adjustment/dispute rows are a separate financial context and
+      are NOT attached to a payment as settlement evidence.
+    A row with neither payment nor order reference is skipped — the
+    relationship is never guessed.
+    """
+    if not isinstance(payload, dict):
+        return []
+    items = payload.get("items", []) or []
+    rows: list[dict] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rtype = (item.get("type") or item.get("entity") or "").lower()
+        entity_id = item.get("entity_id") or ""
+        pid = item.get("payment_id") or ""
+        oid = item.get("order_id") or ""
+        # A payment-type row identifies the payment by entity_id.
+        if rtype == "payment" and entity_id.startswith("pay_") and not pid:
+            pid = entity_id
+        if rtype not in ("payment", "refund"):
+            continue
+        if not pid and not oid:
+            continue
+        key = pid or oid or entity_id
+        rows.append({
+            "recon_id": f"{settlement_id}:{rtype}:{key}",
+            "settlement_id": settlement_id,
+            "payment_id": pid or "",
+            "order_id": oid or "",
+            "amount": _safe_int(item.get("amount")),
+            "fee": _safe_int(item.get("fee")),
+            "tax": _safe_int(item.get("tax")),
+            "recon_type": rtype,
+        })
+    return rows
 
 
 class AccountMappingRequest(BaseModel):
@@ -339,10 +399,19 @@ async def process_event(event_id: str, user: CurrentUser = Depends(get_current_u
              "[]", ev_hash, datetime.now(timezone.utc).isoformat()),
         )
 
-        # Get prev hash
+        # Get prev hash — the TRUE chain tail is the decision whose hash is
+        # not referenced as any other decision's prev_decision_hash
+        # (created_at ordering ties are unreliable).
         cursor = await db.execute(
-            "SELECT decision_hash FROM decisions WHERE tenant_id = ? AND decision_id != 'dec_005_tampered' "
-            "ORDER BY created_at DESC LIMIT 1",
+            "SELECT d.decision_hash FROM decisions d "
+            "WHERE d.tenant_id = ? AND d.decision_id != 'dec_005_tampered' "
+            "AND NOT EXISTS ("
+            "  SELECT 1 FROM decisions o "
+            "  WHERE o.tenant_id = d.tenant_id "
+            "    AND o.prev_decision_hash = d.decision_hash "
+            "    AND o.decision_id != 'dec_005_tampered'"
+            ") "
+            "ORDER BY d.created_at DESC, d.decision_hash DESC LIMIT 1",
             (user.tenant_id,),
         )
         prev_row = await cursor.fetchone()
@@ -513,6 +582,42 @@ async def sync_razorpay_data(
                             ),
                         )
                         synced += 1
+                        # Tier 3/4: persist deterministic settlement recon so
+                        # the reconciliation engine can link this settlement
+                        # to its payment(s) and derive fee/tax evidence —
+                        # even when the settlement payload itself carries no
+                        # payment_id.  Recon unavailability (e.g. a pending
+                        # settlement) is tolerated: the settlement then
+                        # surfaces as an auditable UNLINKED case rather than
+                        # being guessed onto a payment.
+                        try:
+                            recon = razorpay_client.fetch_settlement_reconciliation(item["id"])
+                        except razorpay_client.RazorpayAPIError as e:
+                            errors.append(
+                                f"Settlement {item.get('id', '?')}: recon unavailable "
+                                f"({e.category}) — will remain unlinked until recon is available")
+                            continue
+                        for rrow in _recon_rows_from_payload(item["id"], recon):
+                            try:
+                                await db.execute(
+                                    "INSERT INTO razorpay_settlement_recon "
+                                    "(recon_id, tenant_id, settlement_id, payment_id, order_id, "
+                                    " amount, fee, tax, recon_type, recorded_at) "
+                                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                                    "ON CONFLICT(recon_id) DO UPDATE SET "
+                                    "payment_id=excluded.payment_id, order_id=excluded.order_id, "
+                                    "amount=excluded.amount, fee=excluded.fee, tax=excluded.tax, "
+                                    "recon_type=excluded.recon_type, recorded_at=excluded.recorded_at",
+                                    (
+                                        rrow["recon_id"], user.tenant_id,
+                                        rrow["settlement_id"], rrow["payment_id"],
+                                        rrow["order_id"], rrow["amount"], rrow["fee"],
+                                        rrow["tax"], rrow["recon_type"], now,
+                                    ),
+                                )
+                            except Exception as e:
+                                errors.append(
+                                    f"Settlement {item.get('id', '?')} recon row: {e}")
                     except Exception as e:
                         failed += 1
                         errors.append(f"Settlement {item.get('id', '?')}: {e}")
@@ -525,6 +630,30 @@ async def sync_razorpay_data(
                 (synced, failed, now, user.tenant_id, sync_type),
             )
             await db.commit()
+
+        except razorpay_client.RazorpayAPIError as e:
+            # Controlled upstream failure — record it in sync metadata and
+            # map to a precise HTTP status.  Never a generic 500, never a
+            # leaked secret.
+            duration_ms = int((_time.time() - start) * 1000)
+            await db.execute(
+                "UPDATE razorpay_sync_metadata SET status='failed', error_message=?, records_synced=?, records_failed=?, completed_at=? "
+                "WHERE tenant_id=? AND sync_type=? AND status='running'",
+                (f"{e.category}: {e.diagnostic}", synced, failed, now, user.tenant_id, sync_type),
+            )
+            await db.commit()
+            logger.warning("Razorpay sync %s failed: %s", sync_type, e.category)
+            await log_audit(user.tenant_id, "razorpay.sync.failed", sync_type, "sync",
+                            user_id=user.user_id,
+                            details={"sync_type": sync_type, "category": e.category,
+                                     "status_code": e.status_code})
+            if e.category == "auth":
+                raise HTTPException(502, "Razorpay API authentication failed (invalid or unauthorized credentials)")
+            if e.category == "rate_limited":
+                raise HTTPException(429, "Razorpay API rate limit exceeded — retry later")
+            if e.category == "network":
+                raise HTTPException(503, "Razorpay API unreachable — check connectivity and retry")
+            raise HTTPException(502, "Razorpay API upstream error — retry later")
 
         except Exception as e:
             duration_ms = int((_time.time() - start) * 1000)
@@ -594,8 +723,11 @@ async def get_synced_data(
 
 
 def _serialize_event(event) -> dict:
+    event_type = event["event_type"]
+    # Canonical classification from the single event registry.
+    classification = razorpay_registry.classify_event(event_type)
     return {
-        "event_id": event["event_id"], "event_type": event["event_type"],
+        "event_id": event["event_id"], "event_type": event_type,
         "source": event.get("source", "unknown"),
         "verification_status": event.get("verification_status", "unverified"),
         "razorpay_entity_type": event.get("razorpay_entity_type", "unknown"),
@@ -609,6 +741,11 @@ def _serialize_event(event) -> dict:
         "received_at": event.get("received_at", ""),
         "extracted_facts": _parse_facts(event.get("extracted_facts", "[]")),
         "linked_decision_id": event.get("linked_decision_id"),
+        "event_family": classification["family"],
+        "known_event": classification["known"],
+        "financial_relevance": classification["financial_relevance"],
+        "affects_reconciliation": classification["affects_reconciliation"],
+        "context_risk_only": classification["context_risk_only"],
     }
 
 

@@ -65,6 +65,16 @@ async def store_event(
     # Extract facts deterministically
     extracted_facts = []
     extracted_facts.append({"fact": f"Razorpay event: {event_type} (source: {source})", "confidence": 1.0})
+    # Canonical family classification from the event registry — persisted
+    # with the event so downstream consumers agree on how to treat it.
+    from razorpay_registry import classify_event
+    classification = classify_event(event_type)
+    extracted_facts.append({
+        "fact": f"Event family: {classification['family']} "
+                f"(financial_relevance={classification['financial_relevance']}, "
+                f"affects_reconciliation={classification['affects_reconciliation']})",
+        "confidence": 1.0,
+    })
     if verification_status == "verified":
         extracted_facts.append({"fact": "Event signature verified by HMAC-SHA256", "confidence": 1.0})
     if payment_id:

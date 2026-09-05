@@ -57,14 +57,21 @@ class ReconciliationCaseResponse(BaseModel):
     exception_codes: list[str] = Field(default_factory=list)
     exceptions: list[dict] = Field(default_factory=list)
     ai_status: str
+    ai_invoked: bool = False
     ai_confidence: Optional[float] = None
     ai_interpretation: dict = Field(default_factory=dict)
     ai_technical_reason: str = ""
+    ai_trigger_reason: str = ""
+    ai_tool_calls: int = 0
     calculation_trace: dict = Field(default_factory=dict)
     match_info: dict = Field(default_factory=dict)
     decision_id: str = ""
     explanation: str = ""
     related_record_ids: list[str] = Field(default_factory=list)
+    # Tier 1-7 analysis + relationship graph (deterministic).
+    tier_findings: list[dict] = Field(default_factory=list)
+    tiers_applied: list[int] = Field(default_factory=list)
+    relationships: list[dict] = Field(default_factory=list)
     created_at: str = ""
 
 
@@ -102,4 +109,13 @@ class ReconciliationDashboard(BaseModel):
     total_variance: int
     unresolved_exceptions: list[dict] = Field(default_factory=list)
     false_auto_resolve_risk_cases: list[dict] = Field(default_factory=list)
-    ledger_verified: bool = True
+    ledger_verified: bool = False
+    ledger_check: dict = Field(
+        default_factory=dict,
+        description="Real hash-chain verification summary (checked_count, chains, issues)",
+    )
+    # Tier distribution across all cases (real counts from tier_analysis).
+    tier_counts: dict = Field(default_factory=dict)
+    ai_invoked_cases: int = 0
+    ai_invocation_rate: float = 0.0
+    deterministic_only_rate: float = 0.0

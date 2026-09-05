@@ -282,11 +282,15 @@ CREATE TABLE IF NOT EXISTS reconciliation_cases (
     exception_codes JSONB NOT NULL DEFAULT '[]',
     exceptions JSONB NOT NULL DEFAULT '[]',
     ai_status VARCHAR(32) NOT NULL DEFAULT 'not_needed',
+    ai_invoked BOOLEAN NOT NULL DEFAULT FALSE,
     ai_confidence DOUBLE PRECISION,
     ai_interpretation JSONB NOT NULL DEFAULT '{}',
     ai_technical_reason TEXT NOT NULL DEFAULT '',
+    ai_trigger_reason TEXT NOT NULL DEFAULT '',
+    ai_tool_calls INTEGER NOT NULL DEFAULT 0,
     calculation_trace JSONB NOT NULL DEFAULT '{}',
     match_info JSONB NOT NULL DEFAULT '{}',
+    tier_analysis JSONB NOT NULL DEFAULT '{}',
     decision_id VARCHAR(128) NOT NULL DEFAULT '',
     explanation TEXT NOT NULL DEFAULT '',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
@@ -295,6 +299,24 @@ CREATE INDEX IF NOT EXISTS idx_rec_cases_tenant ON reconciliation_cases(tenant_i
 CREATE INDEX IF NOT EXISTS idx_rec_cases_run ON reconciliation_cases(tenant_id, run_id);
 CREATE INDEX IF NOT EXISTS idx_rec_cases_class ON reconciliation_cases(classification);
 CREATE INDEX IF NOT EXISTS idx_rec_cases_payment ON reconciliation_cases(tenant_id, payment_id);
+
+-- Settlement recon data (Tier 3 linkage + Tier 4 fee/tax evidence).
+-- Persisted during Razorpay settlement sync from GET /settlements/{id}/recon.
+CREATE TABLE IF NOT EXISTS razorpay_settlement_recon (
+    recon_id VARCHAR(192) PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL REFERENCES tenants(tenant_id),
+    settlement_id VARCHAR(128) NOT NULL,
+    payment_id VARCHAR(128) NOT NULL DEFAULT '',
+    order_id VARCHAR(128) NOT NULL DEFAULT '',
+    amount BIGINT NOT NULL DEFAULT 0,
+    fee BIGINT NOT NULL DEFAULT 0,
+    tax BIGINT NOT NULL DEFAULT 0,
+    recon_type VARCHAR(32) NOT NULL DEFAULT '',
+    recorded_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_recon_settlement ON razorpay_settlement_recon(tenant_id, settlement_id);
+CREATE INDEX IF NOT EXISTS idx_recon_payment ON razorpay_settlement_recon(tenant_id, payment_id);
 
 -- Batch reconciliation run with real aggregate metrics
 CREATE TABLE IF NOT EXISTS reconciliation_runs (
@@ -322,6 +344,17 @@ CREATE TABLE IF NOT EXISTS reconciliation_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_rec_runs_tenant ON reconciliation_runs(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_rec_runs_status ON reconciliation_runs(status);
+
+-- Idempotency keys for reconciliation run POSTs (client retry safety).
+CREATE TABLE IF NOT EXISTS reconciliation_run_idempotency (
+    id SERIAL PRIMARY KEY,
+    tenant_id VARCHAR(128) NOT NULL REFERENCES tenants(tenant_id),
+    idempotency_key VARCHAR(128) NOT NULL,
+    run_id VARCHAR(128) NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (tenant_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_run_idem_run ON reconciliation_run_idempotency(run_id);
 """
 
 # ---------------------------------------------------------------------------
@@ -581,11 +614,15 @@ CREATE TABLE IF NOT EXISTS reconciliation_cases (
     exception_codes TEXT NOT NULL DEFAULT '[]',
     exceptions TEXT NOT NULL DEFAULT '[]',
     ai_status TEXT NOT NULL DEFAULT 'not_needed',
+    ai_invoked INTEGER NOT NULL DEFAULT 0,
     ai_confidence REAL,
     ai_interpretation TEXT NOT NULL DEFAULT '{}',
     ai_technical_reason TEXT NOT NULL DEFAULT '',
+    ai_trigger_reason TEXT NOT NULL DEFAULT '',
+    ai_tool_calls INTEGER NOT NULL DEFAULT 0,
     calculation_trace TEXT NOT NULL DEFAULT '{}',
     match_info TEXT NOT NULL DEFAULT '{}',
+    tier_analysis TEXT NOT NULL DEFAULT '{}',
     decision_id TEXT NOT NULL DEFAULT '',
     explanation TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
@@ -623,6 +660,19 @@ CREATE TABLE IF NOT EXISTS reconciliation_runs (
 );
 CREATE INDEX IF NOT EXISTS idx_rec_runs_tenant ON reconciliation_runs(tenant_id);
 CREATE INDEX IF NOT EXISTS idx_rec_runs_status ON reconciliation_runs(status);
+
+-- Idempotency keys for reconciliation run POSTs.  A client retry (timeout /
+-- network failure) with the SAME key returns the ORIGINAL run instead of
+-- creating a duplicate run / duplicate cases / duplicate ledger decisions.
+CREATE TABLE IF NOT EXISTS reconciliation_run_idempotency (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    tenant_id TEXT NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE (tenant_id, idempotency_key)
+);
+CREATE INDEX IF NOT EXISTS idx_run_idem_run ON reconciliation_run_idempotency(run_id);
 """
 
 
@@ -974,7 +1024,58 @@ async def _sqlite_migrate(db):
         ("audit_log", "entity_type", "TEXT NOT NULL DEFAULT 'unknown'"),
         ("scenarios", "policy_ids", "TEXT NOT NULL DEFAULT '[]'"),
         ("evidence", "ai_analyzed", "INTEGER NOT NULL DEFAULT 0"),
+        # 0007 — first-class AI investigation metadata on reconciliation cases
+        ("reconciliation_cases", "ai_invoked", "INTEGER NOT NULL DEFAULT 0"),
+        ("reconciliation_cases", "ai_trigger_reason", "TEXT NOT NULL DEFAULT ''"),
+        ("reconciliation_cases", "ai_tool_calls", "INTEGER NOT NULL DEFAULT 0"),
+        # 0008 — tier analysis + settlement recon
+        ("reconciliation_cases", "tier_analysis", "TEXT NOT NULL DEFAULT '{}'"),
     ]
+    # 0008 — settlement recon table (Tier 3 deterministic linkage + Tier 4 fee/tax evidence)
+    try:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS razorpay_settlement_recon ("
+            " recon_id TEXT PRIMARY KEY, "
+            " tenant_id TEXT NOT NULL, "
+            " settlement_id TEXT NOT NULL, "
+            " payment_id TEXT NOT NULL DEFAULT '', "
+            " order_id TEXT NOT NULL DEFAULT '', "
+            " amount INTEGER NOT NULL DEFAULT 0, "
+            " fee INTEGER NOT NULL DEFAULT 0, "
+            " tax INTEGER NOT NULL DEFAULT 0, "
+            " recon_type TEXT NOT NULL DEFAULT '', "
+            " recorded_at TEXT, "
+            " FOREIGN KEY (tenant_id) REFERENCES tenants(tenant_id)"
+            ")"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recon_settlement ON "
+            "razorpay_settlement_recon(tenant_id, settlement_id)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_recon_payment ON "
+            "razorpay_settlement_recon(tenant_id, payment_id)"
+        )
+    except Exception:
+        pass
+    # 0009 — run POST idempotency keys (safe client retries)
+    try:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS reconciliation_run_idempotency ("
+            " id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            " tenant_id TEXT NOT NULL, "
+            " idempotency_key TEXT NOT NULL, "
+            " run_id TEXT NOT NULL, "
+            " created_at TEXT NOT NULL DEFAULT (datetime('now')), "
+            " UNIQUE (tenant_id, idempotency_key)"
+            ")"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_run_idem_run ON "
+            "reconciliation_run_idempotency(run_id)"
+        )
+    except Exception:
+        pass
     for table, column, col_def in migrations:
         try:
             await db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {col_def}")

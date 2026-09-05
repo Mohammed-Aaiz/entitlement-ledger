@@ -48,9 +48,15 @@ class ReconciliationCaseResult:
     variance: int = 0
     exception_codes: list[str] = field(default_factory=list)
     ai_status: str = ""
+    ai_invoked: bool = False
     ai_technical_reason: str = ""
     latency_ms: int = 0
     decision_id: str = ""
+    # Event graph / tier footprint of the case (from the engine's own
+    # deterministic tier analysis — never fabricated).
+    record_count: int = 0
+    tiers_applied: list[int] = field(default_factory=list)
+    tier_findings: list[dict] = field(default_factory=list)
     # Ground truth (used only by the evaluator)
     gt_classification: str = ""
     gt_exception_code: str = ""
@@ -69,9 +75,13 @@ class ReconciliationCaseResult:
             "variance": self.variance,
             "exception_codes": list(self.exception_codes),
             "ai_status": self.ai_status,
+            "ai_invoked": self.ai_invoked,
             "ai_technical_reason": self.ai_technical_reason,
             "latency_ms": self.latency_ms,
             "decision_id": self.decision_id,
+            "record_count": self.record_count,
+            "tiers_applied": list(self.tiers_applied),
+            "tier_findings": list(self.tier_findings),
             "ground_truth_classification": self.gt_classification,
             "ground_truth_exception_code": self.gt_exception_code,
             "ground_truth_expected_amount": self.gt_expected_amount,
@@ -135,12 +145,17 @@ def run_reconciliation_benchmark(
     clock = time.perf_counter
     start = clock()
     # failure mode REQUESTs AI like llm mode — the injected failing provider
-    # is genuinely invoked for every case and must fail safely.  deterministic
-    # mode keeps NO AI at all.
+    # is genuinely invoked for every AI-reachable case and must fail safely.
+    # failure mode forces invocation (force_ai) because its purpose is to
+    # exercise provider-failure safety on all applicable cases; llm mode
+    # applies the deterministic AI gate so only genuinely ambiguous cases
+    # consume provider capacity (demand-driven).  deterministic mode keeps
+    # NO AI at all.
     use_ai = mode in ("llm", "failure")
+    force_ai = mode == "failure"
     for case in dataset:
         case_start = clock()
-        result = _evaluate_case(case, provider, use_ai=use_ai)
+        result = _evaluate_case(case, provider, use_ai=use_ai, force_ai=force_ai)
         result.latency_ms = max(int((clock() - case_start) * 1000), 1)
         run.results.append(result)
 
@@ -154,7 +169,7 @@ def run_reconciliation_benchmark(
     return run
 
 
-def _evaluate_case(case: DatasetCase, provider, use_ai: bool) -> ReconciliationCaseResult:
+def _evaluate_case(case: DatasetCase, provider, use_ai: bool, force_ai: bool = False) -> ReconciliationCaseResult:
     """Run one dataset case through the controller and attach ground truth."""
     result = ReconciliationCaseResult(
         case_id=case.case_id,
@@ -168,6 +183,7 @@ def _evaluate_case(case: DatasetCase, provider, use_ai: bool) -> ReconciliationC
 
     try:
         records = [FinancialRecord.from_dict(r) for r in records_for_inference(case)]
+        result.record_count = len(records)
         reconciled = reconcile_payment(
             tenant_id="benchmark",
             payment_id=case.payment_id,
@@ -175,6 +191,7 @@ def _evaluate_case(case: DatasetCase, provider, use_ai: bool) -> ReconciliationC
             use_ai=use_ai,
             provider=provider,
             order_id=case.order_id,
+            force_ai=force_ai,
         )
         result.classification = reconciled.classification
         result.expected_amount = reconciled.expected_amount
@@ -182,8 +199,11 @@ def _evaluate_case(case: DatasetCase, provider, use_ai: bool) -> ReconciliationC
         result.variance = reconciled.variance
         result.exception_codes = reconciled.exception_codes
         result.ai_status = reconciled.ai_status
+        result.ai_invoked = reconciled.ai_invoked
         result.ai_technical_reason = reconciled.ai_technical_reason
         result.decision_id = reconciled.decision_id
+        result.tiers_applied = list(getattr(reconciled, "tiers_applied", []) or [])
+        result.tier_findings = list(getattr(reconciled, "tier_findings", []) or [])
     except Exception as e:  # noqa: BLE001 — benchmark must not abort
         result.error = f"{type(e).__name__}: {e}"
         result.classification = "ERROR"

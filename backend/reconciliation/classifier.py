@@ -253,9 +253,14 @@ def decide(
             )
 
     # ── 5. Contradictory evidence ──
+    # Deterministic sources of contradiction:
+    #   - matcher notes that a total "exceeds" a bound (e.g. refunds > capture)
+    #   - matcher notes that the same refund id was recorded with CONFLICTING
+    #     amounts across deliveries (each amount individually valid)
     if match.notes:
         contradictory_notes = [
-            n for n in match.notes if "exceeds" in n
+            n for n in match.notes
+            if "exceeds" in n or "Contradictory refund" in n
         ]
         if contradictory_notes:
             _merge(
@@ -268,10 +273,16 @@ def decide(
             )
 
     # ── 6. Actual settlement comparison ──
+    # Semantics (sign-preserving):
+    #   variance < 0  → actual < expected → genuine PARTIAL_SETTLEMENT
+    #   variance > 0  → actual > expected → OVER-settlement (amount mismatch,
+    #                   never mislabeled as "partial")
+    #   variance == 0 → books reconcile
+    # The amount-mismatch exception always carries the signed variance.
     if calculation.actual_settlement is not None:
         variance = calculation.variance or 0
         if variance != 0:
-            if abs(variance) < abs(calculation.expected_settlement):
+            if variance < 0 and abs(variance) < abs(calculation.expected_settlement):
                 _merge(
                     gate, CLASS_REVIEW_REQUIRED,
                     [partial_settlement(
@@ -281,7 +292,7 @@ def decide(
                         record_ids,
                         evidence_refs,
                     )],
-                    ["Actual settlement is partial."],
+                    ["Actual settlement is partial (below expected)."],
                 )
             _merge(
                 gate, CLASS_EXCEPTION,
@@ -293,7 +304,11 @@ def decide(
                     record_ids,
                     evidence_refs,
                 )],
-                ["Actual settlement differs from expected settlement."],
+                [
+                    "Actual settlement is above expected (over-settlement)."
+                    if variance > 0 else
+                    "Actual settlement differs from expected settlement."
+                ],
             )
     else:
         # No actual settlement was provided by the caller — cannot verify.

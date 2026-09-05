@@ -118,7 +118,10 @@ def run_benchmark(
             logger.info("Processed %d/%d cases", i + 1, len(cases))
 
     run.completed_at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-    run.duration_ms = int((time.time() - start) * 1000)
+    # Floor at 1ms: a zero-duration run would report throughput of 0 and
+    # make the metrics division by zero unsafe (fast mock runs can finish
+    # within the same millisecond).
+    run.duration_ms = max(int((time.time() - start) * 1000), 1)
 
     return run
 

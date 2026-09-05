@@ -392,3 +392,152 @@ class TestSeedsVisible:
         data = resp.json()
         assert len(data["evidence"]) >= 4
         assert data["integrity"]["valid"] is True
+
+
+# ===========================================================================
+# Tier 3/4 — settlement recon linkage (deterministic, never guessed)
+# ===========================================================================
+
+class TestSettlementReconLinkage:
+    """API-synced settlements carry no payment_id in their own payload; the
+    deterministic link comes from razorpay settlement recon data.  Linkage
+    must be exact — never guessed — and unlinked settlements must surface as
+    auditable evidence instead of being dropped or mis-attached."""
+
+    def _run(self, statements):
+        import asyncio
+        import database
+
+        async def _execute():
+            db = await database.get_db()
+            try:
+                for sql, params in statements:
+                    await db.execute(sql, params)
+                await db.commit()
+            finally:
+                await db.close()
+
+        asyncio.new_event_loop().run_until_complete(_execute())
+
+    def _records(self, tenant="demo"):
+        import asyncio
+        from reconciliation.service import records_from_razorpay_async
+
+        async def _build():
+            return await records_from_razorpay_async(tenant)
+
+        return asyncio.new_event_loop().run_until_complete(_build())
+
+    def _payments_sql(self):
+        return [
+            ("INSERT INTO razorpay_payments (payment_id, tenant_id, order_id, entity_id, amount, currency, status, method, captured, amount_refunded, raw_payload, first_seen_at, last_synced_at) VALUES (?, 'demo', ?, 'payment', ?, 'INR', 'captured', 'card', 1, 0, '{}', '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')", (pid, oid, amount))
+            for pid, oid, amount in self._payments
+        ]
+
+    def _settlements_sql(self):
+        return [
+            ("INSERT INTO razorpay_settlements (settlement_id, tenant_id, amount, currency, status, raw_payload, first_seen_at, last_synced_at) VALUES (?, 'demo', ?, 'INR', 'processed', '{}', '2026-01-03T00:00:00+00:00', '2026-01-03T00:00:00+00:00')", (sid, amount))
+            for sid, amount in self._settlements
+        ]
+
+    def _recon_sql(self):
+        return [
+            ("INSERT INTO razorpay_settlement_recon (recon_id, tenant_id, settlement_id, payment_id, order_id, amount, fee, tax, recon_type, recorded_at) VALUES (?, 'demo', ?, ?, ?, ?, ?, ?, ?, ?)", (rid, sid, pid, oid, amount, fee, tax, rtype, "2026-01-03T00:00:00+00:00"))
+            for rid, sid, pid, oid, amount, fee, tax, rtype in self._recon
+        ]
+
+    def test_direct_payment_recon_row_links_settlement(self):
+        self._payments = [("pay_link_1", "ord_link_1", 100000)]
+        self._settlements = [("setl_link_1", 97900)]
+        self._recon = [("setl_link_1:payment:pay_link_1", "setl_link_1", "pay_link_1", "ord_link_1", 97900, 1800, 300, "payment")]
+        self._run(self._payments_sql() + self._settlements_sql() + self._recon_sql())
+
+        recs = self._records()
+        settlements = [r for r in recs if r["record_type"] == "settlement" and r["external_id"] == "setl_link_1"]
+        assert len(settlements) == 1
+        s = settlements[0]
+        assert s["payment_id"] == "pay_link_1", "recon payment row must link settlement to payment"
+        assert s.get("extra", {}).get("unlinked_settlement") is not True
+
+        fees = [r for r in recs if r["record_type"] == "fee_tax" and r["payment_id"] == "pay_link_1"]
+        assert len(fees) == 1
+        assert fees[0]["fee_amount"] == 1800 and fees[0]["tax_amount"] == 300
+
+    def test_order_level_recon_links_when_unambiguous(self):
+        self._payments = [("pay_link_a", "ord_link_x", 100000), ("pay_link_b", "ord_link_y", 50000)]
+        self._settlements = [("setl_link_2", 47900)]
+        self._recon = [("setl_link_2:order:ord_link_y", "setl_link_2", "", "ord_link_y", 0, 0, 0, "order")]
+        self._run(self._payments_sql() + self._settlements_sql() + self._recon_sql())
+
+        recs = self._records()
+        s = [r for r in recs if r["record_type"] == "settlement" and r["external_id"] == "setl_link_2"][0]
+        assert s["payment_id"] == "pay_link_b"
+
+    def test_ambiguous_order_never_guessed(self):
+        # Two payments share one order and only order-level recon exists —
+        # attaching to the "first" payment would be a guess.
+        self._payments = [("pay_link_c", "ord_link_z", 100000), ("pay_link_d", "ord_link_z", 70000)]
+        self._settlements = [("setl_link_3", 97900)]
+        self._recon = [("setl_link_3:order:ord_link_z", "setl_link_3", "", "ord_link_z", 0, 0, 0, "order")]
+        self._run(self._payments_sql() + self._settlements_sql() + self._recon_sql())
+
+        recs = self._records()
+        s = [r for r in recs if r["record_type"] == "settlement" and r["external_id"] == "setl_link_3"][0]
+        assert s["payment_id"] == "setl_link_3", "ambiguous order-level recon must stay unlinked"
+        assert s["extra"].get("unlinked_settlement") is True
+
+    def test_unlinked_settlement_is_preserved_not_dropped(self):
+        self._payments = []
+        self._settlements = [("setl_link_4", 50000)]
+        self._recon = []
+        self._run(self._payments_sql() + self._settlements_sql() + self._recon_sql())
+
+        recs = self._records()
+        s = [r for r in recs if r["record_type"] == "settlement" and r["external_id"] == "setl_link_4"][0]
+        assert s["payment_id"] == "setl_link_4"
+        assert s["extra"].get("unlinked_settlement") is True
+
+
+class TestReconPayloadMapping:
+    """Razorpay recon payload → deterministic linkage rows."""
+
+    def test_payment_item_uses_entity_id(self):
+        from razorpay_routes import _recon_rows_from_payload
+        payload = {"items": [{
+            "entity_id": "pay_map_1", "type": "payment", "payment_id": None,
+            "order_id": "ord_map_1", "amount": 97100, "fee": 2900, "tax": 0,
+            "settlement_id": "setl_map_1",
+        }]}
+        rows = _recon_rows_from_payload("setl_map_1", payload)
+        assert len(rows) == 1
+        assert rows[0]["payment_id"] == "pay_map_1"
+        assert rows[0]["order_id"] == "ord_map_1"
+        assert rows[0]["fee"] == 2900
+        assert rows[0]["recon_type"] == "payment"
+
+    def test_refund_item_keeps_payment_id(self):
+        from razorpay_routes import _recon_rows_from_payload
+        payload = {"items": [{
+            "entity_id": "rfnd_map_1", "type": "refund", "payment_id": "pay_map_2",
+            "order_id": None, "amount": 242500, "fee": 0, "tax": 0,
+            "settlement_id": "setl_map_2",
+        }]}
+        rows = _recon_rows_from_payload("setl_map_2", payload)
+        assert len(rows) == 1
+        assert rows[0]["payment_id"] == "pay_map_2"
+        assert rows[0]["recon_type"] == "refund"
+
+    def test_transfer_and_unreferenced_items_skipped(self):
+        from razorpay_routes import _recon_rows_from_payload
+        payload = {"items": [
+            {"entity_id": "trf_1", "type": "transfer", "payment_id": "pay_map_3",
+             "order_id": None, "amount": 100296, "fee": 296, "tax": 46},
+            {"entity_id": "adj_1", "type": "adjustment", "payment_id": None,
+             "order_id": None, "amount": 1012, "fee": 0, "tax": 0},
+            {"entity_id": "item_map_4", "type": "payment", "payment_id": None,
+             "order_id": None, "amount": 5000, "fee": 0, "tax": 0},
+        ]}
+        rows = _recon_rows_from_payload("setl_map_3", payload)
+        # Transfer rows are a separate financial context; an item with no
+        # resolvable payment/entity/order reference cannot be linked.
+        assert rows == []

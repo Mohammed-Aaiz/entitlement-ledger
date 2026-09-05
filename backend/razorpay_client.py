@@ -25,6 +25,22 @@ logger = logging.getLogger(__name__)
 BASE_URL = "https://api.razorpay.com/v1"
 
 
+class RazorpayAPIError(Exception):
+    """Controlled upstream Razorpay API failure.
+
+    Raised instead of letting httpx exceptions surface as unhandled 500s.
+    Carries a stable category + the upstream status code so routes can map
+    it to the correct HTTP response.  Never contains credentials; the
+    diagnostic is a sanitized status-line summary only.
+    """
+
+    def __init__(self, category: str, status_code: int = 0, diagnostic: str = ""):
+        self.category = category  # auth | rate_limited | unavailable | bad_gateway | network
+        self.status_code = status_code
+        self.diagnostic = diagnostic
+        super().__init__(f"Razorpay API {category} (HTTP {status_code or 'n/a'}): {diagnostic}")
+
+
 def _get_credentials() -> tuple[Optional[str], Optional[str]]:
     """Return (key_id, key_secret) from env. Either or both may be None."""
     key_id = os.environ.get("RAZORPAY_KEY_ID")
@@ -51,43 +67,98 @@ def get_connection_info() -> dict:
     }
 
 
+def _detect_mode(key_id: Optional[str]) -> str:
+    """Detect the Razorpay mode from the key prefix.
+
+    A configured rzp_test_ key is TEST mode; rzp_live_ (or a non-test
+    key id) is LIVE mode; no key is 'none'.  Mode is never inferred from
+    mere presence of credentials.
+    """
+    if not key_id:
+        return "none"
+    if key_id.startswith("rzp_test_"):
+        return "test"
+    return "live"
+
+
 def get_status() -> dict:
     """Return integration status for the /api/razorpay/status endpoint.
 
-    Reports live vs demo mode. Never exposes secret values.
+    Reports test/live/none mode derived from the key prefix — test
+    credentials are NEVER reported as LIVE MODE.  Never exposes secrets.
     """
     key_id, key_secret = _get_credentials()
     webhook_secret = os.environ.get("RAZORPAY_WEBHOOK_SECRET")
     configured = bool(key_id and key_secret)
+    # mode: 'test' for rzp_test_ keys (NEVER live), 'live' for live keys,
+    # 'demo' when not configured (backwards-compatible with the UI).
+    mode = _detect_mode(key_id) if configured else "demo"
     return {
         "configured": configured,
-        "mode": "live" if configured else "demo",
+        "mode": mode,
+        "test_mode": mode == "test",
         "webhook_configured": bool(webhook_secret),
         "key_id_preview": f"{key_id[:8]}..." if key_id else None,
     }
 
 
 def _request(method: str, path: str, **kwargs) -> dict:
-    """Make an authenticated Razorpay API request."""
+    """Make an authenticated Razorpay API request.
+
+    Upstream failures are mapped to controlled RazorpayAPIError instances
+    (auth / rate_limited / unavailable / bad_gateway / network) instead of
+    leaking as unhandled httpx exceptions.  Never includes secrets in the
+    diagnostic.
+    """
     key_id, key_secret = _get_credentials()
     if not key_id or not key_secret:
-        raise EnvironmentError(
-            "Razorpay credentials not configured. "
-            "Set RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET."
+        raise RazorpayAPIError(
+            "auth", 0, "Razorpay credentials not configured (RAZORPAY_KEY_ID / RAZORPAY_KEY_SECRET)"
         )
 
     url = f"{BASE_URL}{path}"
     logger.info("Razorpay %s %s", method.upper(), path)
 
-    with httpx.Client(timeout=15.0) as client:
-        resp = client.request(
-            method,
-            url,
-            auth=(key_id, key_secret),
-            **kwargs,
+    try:
+        with httpx.Client(timeout=15.0) as client:
+            resp = client.request(
+                method,
+                url,
+                auth=(key_id, key_secret),
+                **kwargs,
+            )
+    except httpx.TimeoutException:
+        raise RazorpayAPIError("network", 0, "Razorpay request timed out")
+    except httpx.RequestError as e:
+        raise RazorpayAPIError("network", 0, f"Razorpay connection error: {type(e).__name__}")
+
+    if resp.status_code >= 400:
+        _raise_upstream_error(resp.status_code)
+    return resp.json()
+
+
+def _raise_upstream_error(status_code: int) -> None:
+    """Map a Razorpay upstream HTTP status to a controlled error."""
+    if status_code in (401, 403):
+        raise RazorpayAPIError(
+            "auth", status_code,
+            "Razorpay API authentication failed (invalid or unauthorized credentials)",
         )
-        resp.raise_for_status()
-        return resp.json()
+    if status_code == 429:
+        raise RazorpayAPIError(
+            "rate_limited", status_code,
+            "Razorpay API rate limit exceeded",
+        )
+    if status_code >= 500:
+        category = "unavailable" if status_code == 503 else "bad_gateway"
+        raise RazorpayAPIError(
+            category, status_code,
+            f"Razorpay API upstream error (HTTP {status_code})",
+        )
+    raise RazorpayAPIError(
+        "bad_gateway", status_code,
+        f"Razorpay API unexpected error (HTTP {status_code})",
+    )
 
 
 def fetch_payment(payment_id: str) -> dict:
@@ -156,15 +227,22 @@ def fetch_settlement_reconciliation(settlement_id: str) -> dict:
 def test_connection() -> dict:
     """Test API connectivity by fetching account balance.
 
-    Returns: {"ok": bool, "balance": int|None, "error": str|None}
+    Returns: {"ok": bool, "balance": int|None, "error": str|None,
+    "category": str|None, "status_code": int}
     """
     try:
         result = _request("GET", "/payments/account")
-        return {"ok": True, "balance": None, "error": None, "account": result.get("id", "")}
+        return {"ok": True, "balance": None, "error": None, "account": result.get("id", ""),
+                "category": None, "status_code": 200}
+    except RazorpayAPIError as e:
+        return {"ok": False, "balance": None, "error": e.diagnostic,
+                "category": e.category, "status_code": e.status_code}
     except EnvironmentError as e:
-        return {"ok": False, "balance": None, "error": str(e)}
+        return {"ok": False, "balance": None, "error": str(e),
+                "category": "auth", "status_code": 0}
     except Exception as e:
-        return {"ok": False, "balance": None, "error": str(e)}
+        return {"ok": False, "balance": None, "error": str(e),
+                "category": "bad_gateway", "status_code": 0}
 
 
 # ---------------------------------------------------------------------------

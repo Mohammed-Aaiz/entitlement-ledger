@@ -403,12 +403,24 @@ class TestAIAvailability:
             assert is_ai_available() is False
 
     def test_with_api_key(self):
-        """Returns True when Anthropic API key is set (provider may not connect)."""
+        """Returns True when the Anthropic key is set AND the SDK is importable.
+
+        The Anthropic SDK is intentionally NOT a project dependency (the
+        provider stays an optional import path), so availability is gated on
+        both the key and a successful ``import anthropic``.  This test fakes
+        the import to exercise the real key+import contract without adding
+        the SDK to the dependency set.
+        """
         with patch.dict(os.environ, {"ANTHROPIC_API_KEY": "test-key"}):
             reset_provider()
-            # AnthropicProvider.is_available() checks key + import, so this returns True
+            import sys
+            from unittest.mock import Mock
             from ai.llm_provider import AnthropicProvider
-            assert AnthropicProvider().is_available() is True
+            with patch.dict("sys.modules", {"anthropic": Mock()}):
+                assert AnthropicProvider().is_available() is True
+            # Without an importable SDK the provider is NOT available even
+            # when a key exists (dependency policy — never fabricate support).
+            assert AnthropicProvider().is_available() is False
 
 
 class TestPipelineWithMock:

@@ -682,7 +682,16 @@ class GeminiProvider(LLMProvider):
         if not parts:
             raise ValueError("Gemini returned empty response (no parts)")
 
-        content = parts[0].text
+        # Join ALL text parts (Gemini may stream the answer across multiple
+        # parts, and thinking/thought parts must never be surfaced as output).
+        # ``thought`` is checked with an identity test against True so that
+        # mocked parts in tests (whose .thought returns a truthy Mock) are
+        # still treated as ordinary text parts.
+        content = "".join(
+            getattr(part, "text", "") or ""
+            for part in parts
+            if getattr(part, "thought", False) is not True
+        )
         if not content:
             raise ValueError("Gemini returned empty text in response")
 
@@ -1561,7 +1570,7 @@ def get_provider() -> LLMProvider:
 
         if prod_provider == "groq":
             groq_key = os.environ.get("GROQ_API_KEY", "")
-            groq_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+            groq_model = _env_value("GROQ_MODEL", "openai/gpt-oss-120b")
             groq = GroqProvider(api_key=groq_key, model=groq_model)
             if groq.is_available():
                 _provider_instance = groq
@@ -1572,7 +1581,7 @@ def get_provider() -> LLMProvider:
 
         elif prod_provider == "gemini":
             gemini_key = os.environ.get("GEMINI_API_KEY", "")
-            gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+            gemini_model = _env_value("GEMINI_MODEL", "gemini-2.5-flash")
             gemini = GeminiProvider(api_key=gemini_key, model=gemini_model)
             if gemini.is_available():
                 _provider_instance = gemini
@@ -1596,8 +1605,8 @@ def get_provider() -> LLMProvider:
 
     # --- Development mode: try providers in priority order ---
     # 1. Ollama (local, free, no API key)
-    model_name = os.environ.get("OLLAMA_MODEL", "qwen3.5:latest")
-    base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+    model_name = _env_value("OLLAMA_MODEL", "qwen3.5:latest")
+    base_url = _env_value("OLLAMA_BASE_URL", "http://localhost:11434")
     ollama = OllamaProvider(base_url=base_url, model=model_name)
     if ollama.is_available():
         logger.info("Using Ollama provider (model=%s) [development only]", model_name)
@@ -1607,7 +1616,7 @@ def get_provider() -> LLMProvider:
     # 2. Groq (cloud, fast, requires GROQ_API_KEY)
     groq_key = os.environ.get("GROQ_API_KEY", "")
     if groq_key:
-        groq_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+        groq_model = _env_value("GROQ_MODEL", "openai/gpt-oss-120b")
         groq = GroqProvider(api_key=groq_key, model=groq_model)
         if groq.is_available():
             logger.info("Using Groq provider (model=%s)", groq_model)
@@ -1617,7 +1626,7 @@ def get_provider() -> LLMProvider:
     # 3. Gemini (cloud, requires GEMINI_API_KEY)
     gemini_key = os.environ.get("GEMINI_API_KEY", "")
     if gemini_key:
-        gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        gemini_model = _env_value("GEMINI_MODEL", "gemini-2.5-flash")
         gemini = GeminiProvider(api_key=gemini_key, model=gemini_model)
         if gemini.is_available():
             logger.info("Using Gemini provider (model=%s)", gemini_model)
@@ -1627,8 +1636,8 @@ def get_provider() -> LLMProvider:
     # 4. OpenRouter (cloud, requires OPENROUTER_API_KEY)
     openrouter_key = os.environ.get("OPENROUTER_API_KEY", "")
     if openrouter_key:
-        openrouter_model = os.environ.get("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
-        openrouter_url = os.environ.get("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+        openrouter_model = _env_value("OPENROUTER_MODEL", "google/gemma-4-31b-it:free")
+        openrouter_url = _env_value("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
         openrouter = OpenRouterProvider(
             api_key=openrouter_key,
             model=openrouter_model,
@@ -1640,7 +1649,7 @@ def get_provider() -> LLMProvider:
 
     # 5. Anthropic (cloud, requires ANTHROPIC_API_KEY)
     if os.environ.get("ANTHROPIC_API_KEY"):
-        anthropic_model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
+        anthropic_model = _env_value("ANTHROPIC_MODEL", "claude-sonnet-4-20250514")
         claude = AnthropicProvider(model=anthropic_model)
         if claude.is_available():
             logger.info("Using Anthropic provider (model=%s)", anthropic_model)
@@ -1659,20 +1668,31 @@ def get_provider() -> LLMProvider:
     )
 
 
+def _env_value(name: str, default: str = "") -> str:
+    """Read an env var, treating empty/blank values as unset.
+
+    A trailing-empty GEMINI_MODEL= in .env must not override the default
+    model (it previously produced GeminiProvider(model="") which fails at
+    the API with 'model is required').
+    """
+    value = os.environ.get(name, default)
+    return value if value and value.strip() else default
+
+
 def get_provider_by_name(name: str) -> LLMProvider:
     """Get a specific provider by name (for benchmark parity tests)."""
     name = name.lower().strip()
     if name == "ollama":
-        model_name = os.environ.get("OLLAMA_MODEL", "qwen3.5:latest")
-        base_url = os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434")
+        model_name = _env_value("OLLAMA_MODEL", "qwen3.5:latest")
+        base_url = _env_value("OLLAMA_BASE_URL", "http://localhost:11434")
         return OllamaProvider(base_url=base_url, model=model_name)
     elif name == "groq":
         groq_key = os.environ.get("GROQ_API_KEY", "")
-        groq_model = os.environ.get("GROQ_MODEL", "openai/gpt-oss-120b")
+        groq_model = _env_value("GROQ_MODEL", "openai/gpt-oss-120b")
         return GroqProvider(api_key=groq_key, model=groq_model)
     elif name == "gemini":
         gemini_key = os.environ.get("GEMINI_API_KEY", "")
-        gemini_model = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+        gemini_model = _env_value("GEMINI_MODEL", "gemini-2.5-flash")
         return GeminiProvider(api_key=gemini_key, model=gemini_model)
     else:
         raise ValueError(f"Unknown provider: {name}. Valid: ollama, groq, gemini")

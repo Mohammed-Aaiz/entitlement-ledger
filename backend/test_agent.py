@@ -2076,8 +2076,39 @@ class TestNativeToolDefinitions:
             assert "properties" in params, "Parameters must have properties"
             assert "required" in params, "Parameters must have required"
 
+    def test_optional_parameters_not_marked_required(self):
+        """Optional tool parameters must stay in properties but NOT in
+        ``required``.  Marking them required makes Groq reject valid calls
+        such as ``get_settlement({"order_id": "ord_real_1"})`` when
+        ``settlement_id`` is optional (HTTP 400 tool_use_failed)."""
+        from ai.agent import _build_native_tool_definitions
+
+        tools = _build_native_tool_definitions()
+        by_name = {t["function"]["name"]: t["function"] for t in tools}
+
+        # get_settlement / get_payment accept either ID — both params optional.
+        for name in ("get_settlement", "get_payment"):
+            params = by_name[name]["parameters"]
+            assert "settlement_id" in params["properties"] or "order_id" in params["properties"] or "payment_id" in params["properties"]
+            required = params["required"]
+            # Optional lookups must be callable with a single ID, so no
+            # parameter may be forced into "required".
+            assert required == [], f"{name} optional params forced required: {required}"
+
+        # get_settlement({order_id: ...}) must be schema-valid: order_id is
+        # declared as a property and the schema does not demand settlement_id.
+        settlement = by_name["get_settlement"]["parameters"]
+        assert "order_id" in settlement["properties"]
+        assert "settlement_id" not in settlement["required"]
+        assert "order_id" not in settlement["required"]
+
+        # Genuinely required params stay required.
+        order = by_name["get_order"]["parameters"]
+        assert order["required"] == ["order_id"]
+
     def test_tool_call_response_dataclass(self):
         """ToolCallResponse should have required fields."""
+
         from ai.llm_provider import ToolCallResponse, ToolCallInfo
 
         # Empty response

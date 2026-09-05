@@ -29,11 +29,17 @@ class ReconciliationBenchmarkMetrics:
     model: str = ""
     total_cases: int = 0
     total_records: int = 0
+    total_events: int = 0
     matched: int = 0
     review_required: int = 0
     exceptions: int = 0
     errors: int = 0
     match_rate: float = 0.0
+    # Tier 1-7 footprint (count of cases that exercised each tier).
+    tier_distribution: dict = field(default_factory=dict)
+    # Deterministic vs AI-assisted resolution split (never conflated).
+    deterministic_resolved: int = 0
+    ai_resolved: int = 0
     # Accuracy vs hidden ground truth
     classification_accuracy: float = 0.0
     calculation_accuracy: float = 0.0
@@ -53,6 +59,7 @@ class ReconciliationBenchmarkMetrics:
     ai_available_count: int = 0
     ai_unavailable_count: int = 0
     ai_failed_count: int = 0
+    ai_invoked_count: int = 0  # cases where the provider was genuinely invoked
     # Unresolved exception list (individually)
     unresolved_exceptions: list[dict] = field(default_factory=list)
     # Per-scenario breakdown
@@ -119,6 +126,8 @@ def compute_reconciliation_metrics(run: ReconciliationBenchmarkRun) -> Reconcili
             m.ai_unavailable_count += 1
         elif r.ai_status == AI_FAILED:
             m.ai_failed_count += 1
+        if getattr(r, "ai_invoked", False):
+            m.ai_invoked_count += 1
 
         # Unresolved exceptions, listed individually
         if r.classification in (CLASS_REVIEW_REQUIRED, CLASS_EXCEPTION):
@@ -138,9 +147,26 @@ def compute_reconciliation_metrics(run: ReconciliationBenchmarkRun) -> Reconcili
                 "human_review_required": True,
             })
 
-    m.total_records = sum(
-        1 for _ in results
-    )  # per-case record count varies; cases are the unit here
+    # Total events = sum of the actual records processed per case.
+    m.total_records = sum(getattr(r, "record_count", 1) for r in results)
+    m.total_events = m.total_records
+
+    # Tier distribution: a case can exercise more than one tier.
+    tier_counts: dict = {}
+    for r in results:
+        for t in (getattr(r, "tiers_applied", None) or []):
+            tier_counts[int(t)] = tier_counts.get(int(t), 0) + 1
+    m.tier_distribution = {
+        str(t): tier_counts.get(t, 0) for t in range(1, 8)
+    }
+
+    # Deterministic vs AI-assisted: a case is deterministically resolved
+    # when AI was never invoked for it (gated out or deterministic mode);
+    # AI-assisted when the provider genuinely ran.
+    m.deterministic_resolved = sum(
+        1 for r in results if not getattr(r, "ai_invoked", False)
+    )
+    m.ai_resolved = sum(1 for r in results if getattr(r, "ai_invoked", False))
 
     m.classification_accuracy = m.classification_accuracy / m.total_cases
     m.calculation_accuracy = m.calculation_accuracy / m.total_cases
@@ -206,6 +232,8 @@ def reconciliation_metrics_to_dict(m: ReconciliationBenchmarkMetrics, run: Recon
         "dataset_seed": run.dataset_seed,
         "total_cases": m.total_cases,
         "total_records": m.total_records,
+        "total_events": m.total_events,
+        "tier_distribution": m.tier_distribution,
         "status": {
             "matched": m.matched,
             "review_required": m.review_required,
@@ -237,6 +265,12 @@ def reconciliation_metrics_to_dict(m: ReconciliationBenchmarkMetrics, run: Recon
             "available": m.ai_available_count,
             "unavailable": m.ai_unavailable_count,
             "failed": m.ai_failed_count,
+            "invoked": m.ai_invoked_count,
+            "invocation_rate": round(
+                m.ai_invoked_count / m.total_cases, 4
+            ) if m.total_cases else 0.0,
+            "deterministic_resolved": m.deterministic_resolved,
+            "ai_resolved": m.ai_resolved,
             "provider_invocations": run.provider_invocations,
         },
         "scenario_metrics": m.scenario_metrics,
@@ -252,11 +286,26 @@ def reconciliation_metrics_to_markdown(m: ReconciliationBenchmarkMetrics, run: R
     lines.append("## Dataset")
     lines.append("")
     lines.append(f"- **Cases:** {m.total_cases} (seed {run.dataset_seed})")
+    lines.append(f"- **Events processed:** {m.total_events}")
     lines.append(f"- **Provider:** {run.provider or 'none'}")
     lines.append(f"- **Model:** {run.model or 'none'}")
     lines.append(f"- **Mode:** {d['mode_label']}")
     lines.append(f"- **Duration:** {run.duration_ms / 1000:.1f}s")
     lines.append(f"- **Run ID:** {run.run_id}")
+    lines.append("")
+    lines.append("## Tier Footprint")
+    lines.append("")
+    lines.append(f"| Tier | Domain | Cases |")
+    lines.append(f"|------|--------|-------|")
+    tier_names = {
+        "1": "Payment / Order", "2": "Refund", "3": "Settlement",
+        "4": "Fee / Tax", "5": "Dispute / Risk",
+        "6": "Invoice / Payment Link",
+        "7": "Operational / Event Integrity",
+    }
+    for t in ("1", "2", "3", "4", "5", "6", "7"):
+        lines.append(f"| {t} | {tier_names[t]} | {m.tier_distribution.get(t, 0)} |")
+    lines.append("")
     lines.append("")
     lines.append("## Outcomes")
     lines.append("")
@@ -298,6 +347,9 @@ def reconciliation_metrics_to_markdown(m: ReconciliationBenchmarkMetrics, run: R
     lines.append(f"| AI available | {m.ai_available_count} |")
     lines.append(f"| AI unavailable | {m.ai_unavailable_count} |")
     lines.append(f"| AI failed | {m.ai_failed_count} |")
+    lines.append(f"| AI invoked (gated) | {m.ai_invoked_count} |")
+    lines.append(f"| Deterministic resolution | {m.deterministic_resolved}/{m.total_cases} |")
+    lines.append(f"| AI-assisted resolution | {m.ai_resolved}/{m.total_cases} |")
     lines.append(f"| Provider invocations | {run.provider_invocations} |")
     lines.append("")
 

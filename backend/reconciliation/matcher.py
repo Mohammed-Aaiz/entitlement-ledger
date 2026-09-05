@@ -26,7 +26,17 @@ from .models import (
     RECORD_SETTLEMENT,
     RECORD_FEE_TAX,
     RECORD_ADJUSTMENT,
+    RECORD_DISPUTE,
+    RECORD_INVOICE,
+    RECORD_PAYMENT_LINK,
+    RECORD_OPERATIONAL,
+    CONTEXT_RECORD_TYPES,
 )
+
+# Non-payment financial record types the calculator consumes.
+_FINANCIAL_RECORD_TYPES = {
+    RECORD_REFUND, RECORD_SETTLEMENT, RECORD_FEE_TAX, RECORD_ADJUSTMENT,
+}
 
 
 @dataclass
@@ -40,10 +50,18 @@ class MatchResult:
     refunds: list[FinancialRecord] = field(default_factory=list)
     fee_taxes: list[FinancialRecord] = field(default_factory=list)
     adjustments: list[FinancialRecord] = field(default_factory=list)
+    # Tier 5-7 context records (disputes, invoices, payment links, operational
+    # events) linked deterministically by payment_id / order_id.  These are
+    # evidence only — they never enter the settlement calculation.
+    context_records: list[FinancialRecord] = field(default_factory=list)
     payment_duplicates: list[FinancialRecord] = field(default_factory=list)
     settlement_duplicates: list[FinancialRecord] = field(default_factory=list)
     unmatched_records: list[FinancialRecord] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    # Refund ids delivered more than once with CONFLICTING amounts.  The
+    # refund total is not trustworthy — the case must escalate, never sum
+    # the conflicting records as if they were independent refunds.
+    refund_conflicts: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -55,10 +73,12 @@ class MatchResult:
             "refunds": [r.to_dict() for r in self.refunds],
             "fee_taxes": [r.to_dict() for r in self.fee_taxes],
             "adjustments": [r.to_dict() for r in self.adjustments],
+            "context_records": [r.to_dict() for r in self.context_records],
             "payment_duplicates": [r.to_dict() for r in self.payment_duplicates],
             "settlement_duplicates": [r.to_dict() for r in self.settlement_duplicates],
             "unmatched_records": [r.to_dict() for r in self.unmatched_records],
             "notes": list(self.notes),
+            "refund_conflicts": list(self.refund_conflicts),
         }
 
 
@@ -88,6 +108,11 @@ def match_records_for_payment(
     refunds = _records_of_type(records, RECORD_REFUND)
     fee_taxes = _records_of_type(records, RECORD_FEE_TAX)
     adjustments = _records_of_type(records, RECORD_ADJUSTMENT)
+
+    # Tier 5-7 context records (dispute/invoice/payment_link/operational).
+    # They are matched to the case by payment_id / order_id like financial
+    # records, but the calculator never reads their amounts.
+    context_records = [r for r in records if r.record_type in CONTEXT_RECORD_TYPES]
 
     # ── 1. Primary payment ──
     primary_payments = [p for p in payments if p.external_id == payment_id]
@@ -131,6 +156,24 @@ def match_records_for_payment(
         if r.payment_id == payment_id or (result.payment and r.payment_id == result.payment.external_id)
     ]
 
+    # ── 3b. Contradictory refund evidence (same refund id, different amounts) ──
+    # Two records carrying the SAME refund id but DIFFERENT amounts are a
+    # genuine contradiction (only one amount can be true).  Each amount is
+    # individually valid, so this is NOT invalid source data — it is
+    # contradictory evidence that must be surfaced, never silently summed
+    # or guessed.  Both records stay visible; the classifier escalates.
+    by_refund_id: dict[str, list] = {}
+    for r in result.refunds:
+        by_refund_id.setdefault(r.external_id, []).append(r)
+    for refund_id, group in by_refund_id.items():
+        amounts = {r.amount for r in group}
+        if len(group) > 1 and len(amounts) > 1:
+            result.refund_conflicts.append(refund_id)
+            result.notes.append(
+                f"Contradictory refund records for refund {refund_id}: recorded "
+                f"amounts {sorted(amounts)} differ across {len(group)} deliveries"
+            )
+
     # ── 4. Fee/tax + adjustments via payment_id or order_id ──
     result.fee_taxes = [
         r for r in fee_taxes
@@ -143,6 +186,15 @@ def match_records_for_payment(
         if r.payment_id == payment_id
         or (result.payment and r.payment_id == result.payment.external_id)
         or (order_id and r.order_id == order_id)
+    ]
+
+    # ── 4b. Context records: deterministic linkage by payment_id / order_id ──
+    result.context_records = [
+        r for r in context_records
+        if r.payment_id == payment_id
+        or (result.payment and r.payment_id == result.payment.external_id)
+        or (r.order_id and order_id and r.order_id == order_id)
+        or (r.order_id and result.payment and r.order_id == result.payment.order_id)
     ]
 
     # ── 5. Refund/payment amount-consistency check ──
@@ -169,12 +221,14 @@ def match_records_for_payment(
         matched_ids.add(result.payment.record_id)
     if result.settlement:
         matched_ids.add(result.settlement.record_id)
-    for r in result.refunds + result.fee_taxes + result.adjustments:
+    for r in result.refunds + result.fee_taxes + result.adjustments + result.context_records:
         matched_ids.add(r.record_id)
     result.unmatched_records = [
         r for r in records
-        if r.record_id not in matched_ids and r.record_type != RECORD_PAYMENT
+        if r.record_id not in matched_ids and r.record_type not in (RECORD_PAYMENT,)
     ]
+    # Context records with no payment/order linkage stay visible as unmatched
+    # (evidence preserved — never silently dropped).
 
     return result
 

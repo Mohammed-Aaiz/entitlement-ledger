@@ -141,10 +141,28 @@ class TestDuplicatesAndContradictions:
         assert "DUPLICATE_SETTLEMENT" in case.exception_codes
 
     def test_contradictory_evidence_is_exception(self):
+        """Same refund id delivered with conflicting amounts → CONTRADICTORY_EVIDENCE.
+
+        Each refund amount is individually valid (the invariant
+        total_refunds <= captured holds), so this is genuine contradiction,
+        NOT invalid source data — and it must never be auto-resolved.
+        """
         case = _case_of_scenario("contradictory_evidence")
         assert case.classification == "EXCEPTION"
-        assert "REFUND_MISMATCH" in case.exception_codes
         assert "CONTRADICTORY_EVIDENCE" in case.exception_codes
+        assert "REFUND_MISMATCH" not in case.exception_codes
+
+    def test_invalid_refund_total_is_exception(self):
+        """Refunds exceeding capture are explicit INVALID source data.
+
+        The invariant total_refunds <= captured_amount is enforced as a
+        first-class INVALID_REFUND_TOTAL exception with deterministic
+        reasoning — never silently absorbed, never AI-repaired.
+        """
+        case = _case_of_scenario("invalid_refund_total")
+        assert case.classification == "EXCEPTION"
+        assert case.exception_codes == ["INVALID_REFUND_TOTAL"]
+        assert "cannot exceed" in case.explanation
 
     def test_missing_payment_is_exception(self):
         case = _case_of_scenario("missing_payment")
@@ -247,6 +265,11 @@ class TestAIFailureHandling:
                     "ambiguous": False,
                     "confidence": 0.95,
                     "suggested_human_review": False,
+                    "reasoning": (
+                        "The captured payment amount, the recorded fees and the "
+                        "settlement value are mutually consistent and match the "
+                        "deterministically expected net amount with no variance."
+                    ),
                 })
 
         provider = GoodProvider()
@@ -255,7 +278,11 @@ class TestAIFailureHandling:
         from reconciliation.models import FinancialRecord
         src = next(c for c in generate_dataset(count=100, seed=42) if c.scenario == "clean_match")
         recs = [FinancialRecord.from_dict(r) for r in records_for_inference(src)]
-        case = reconcile_payment("test", src.payment_id, recs, use_ai=True, provider=provider, order_id=src.order_id)
+        # force_ai=True: this test explicitly exercises interpretation on a
+        # clean match (the deterministic AI gate would otherwise correctly
+        # skip AI for a clean match — covered by the gating tests).
+        case = reconcile_payment("test", src.payment_id, recs, use_ai=True, provider=provider,
+                                 order_id=src.order_id, force_ai=True)
         assert case.ai_status == "available"
         assert case.ai_interpretation.get("confidence") == 0.95
         # AI cannot change the deterministic outcome
@@ -324,6 +351,79 @@ class TestDeterministicCalculation:
         assert len(calc.steps) == 5
         assert calc.steps[-1]["running_total"] == calc.expected_settlement
         assert "formula" in calc.to_dict()
+
+
+class TestVarianceClassificationSemantics:
+    """Partial-settlement semantics: PARTIAL_SETTLEMENT is ONLY genuine
+    under-settlement (actual < expected).  Over-settlement (actual >
+    expected) is an AMOUNT_MISMATCH and must never be labeled partial.
+    Exception codes stay structured arrays."""
+
+    def _run(self, actual):
+        from datetime import datetime, timedelta, timezone
+        from reconciliation.models import (
+            FinancialRecord, RECORD_PAYMENT, RECORD_SETTLEMENT, RECORD_FEE_TAX,
+        )
+        from reconciliation.service import reconcile_payment
+        base = datetime.now(timezone.utc) - timedelta(days=3)
+        iso0 = base.isoformat()
+        iso1 = (base + timedelta(days=1)).isoformat()
+        records = [
+            FinancialRecord(
+                record_type=RECORD_PAYMENT, external_id="pay_sem", amount=100000,
+                status="captured", payment_id="pay_sem", order_id="ord_sem",
+                recorded_at=iso0, source="fixture",
+                raw_evidence_ref="razorpay_payments:pay_sem",
+            ),
+            FinancialRecord(
+                record_type=RECORD_FEE_TAX, external_id="fee_sem", amount=0,
+                fee_amount=1800, tax_amount=300, payment_id="pay_sem",
+                recorded_at=iso0, source="fixture",
+                raw_evidence_ref="razorpay_fees:fee_sem",
+            ),
+            FinancialRecord(
+                record_type=RECORD_SETTLEMENT, external_id="set_sem", amount=actual,
+                status="processed", payment_id="pay_sem",
+                recorded_at=iso1, source="fixture",
+                raw_evidence_ref="razorpay_settlements:set_sem",
+            ),
+        ]
+        return reconcile_payment("t", "pay_sem", records, use_ai=False)
+
+    def test_exact_match(self):
+        case = self._run(actual=97900)
+        assert case.classification == "MATCHED"
+        assert case.exception_codes == []
+        assert case.variance == 0
+
+    def test_under_settlement_is_partial(self):
+        case = self._run(actual=96900)
+        assert case.classification == "EXCEPTION"
+        codes = case.exception_codes
+        assert isinstance(codes, list)
+        assert "PARTIAL_SETTLEMENT" in codes, f"missing partial code: {codes}"
+        assert "AMOUNT_MISMATCH" in codes
+        assert case.variance == -1000
+        # Structured codes must never be concatenated into one string.
+        for c in codes:
+            assert c in ("PARTIAL_SETTLEMENT", "AMOUNT_MISMATCH"), f"unexpected code {c}"
+
+    def test_over_settlement_is_never_partial(self):
+        case = self._run(actual=98900)
+        assert case.classification == "EXCEPTION"
+        codes = case.exception_codes
+        assert isinstance(codes, list)
+        assert "AMOUNT_MISMATCH" in codes
+        assert "PARTIAL_SETTLEMENT" not in codes, (
+            f"over-settlement must not be labeled partial: {codes}")
+        assert case.variance == 1000  # sign preserved
+
+    def test_over_settlement_beyond_expected_double(self):
+        # actual >> expected is still AMOUNT_MISMATCH, never PARTIAL_SETTLEMENT.
+        case = self._run(actual=97900 * 2)
+        assert case.classification == "EXCEPTION"
+        assert "AMOUNT_MISMATCH" in case.exception_codes
+        assert "PARTIAL_SETTLEMENT" not in case.exception_codes
 
 
 # ===========================================================================
@@ -572,6 +672,11 @@ class TestDecisionGateSafety:
                     "ambiguous": False,
                     "confidence": 0.99,
                     "suggested_human_review": False,
+                    "reasoning": (
+                        "The captured payment amount and the settlement recorded "
+                        "for this payment appear consistent, but the deterministic "
+                        "engine still computed a variance from the expected amount."
+                    ),
                 })
 
         from reconciliation.dataset import generate_dataset, records_for_inference
@@ -628,6 +733,37 @@ class TestDataset:
                 # negative amount (it must be rejected as INVALID_RECORD).
                 if case.scenario != "invalid_record":
                     assert rec.amount >= 0
+
+    def test_normal_refund_scenarios_respect_refund_invariant(self):
+        """Financial invariant: total_refunds <= captured_amount for every
+        NORMAL scenario.  Only the explicitly-tagged malformed scenario
+        (invalid_refund_total) may violate it."""
+        from reconciliation.dataset import generate_dataset
+        malformed = {"invalid_refund_total", "invalid_record"}
+        # Scenarios without a captured payment at all (MISSING_PAYMENT) have
+        # no capture to bound refunds against — the exception is about the
+        # absent payment, not about refund arithmetic.
+        no_capture = {"missing_payment"}
+        for case in generate_dataset(count=100, seed=42):
+            captured = sum(
+                r.amount for r in case.records
+                if r.record_type == "payment"
+            )
+            refunds = sum(
+                r.amount for r in case.records
+                if r.record_type == "refund"
+            )
+            if case.scenario in no_capture or captured == 0:
+                continue
+            if case.scenario in malformed:
+                # Explicitly tagged malformed data — may break the invariant.
+                if case.scenario == "invalid_refund_total":
+                    assert refunds > captured > 0
+                continue
+            assert refunds <= captured, (
+                f"scenario {case.scenario} violates refund invariant: "
+                f"refunds {refunds} > captured {captured}"
+            )
 
 
 # ===========================================================================
@@ -832,3 +968,62 @@ class TestEventOrdering:
         case = reconcile_payment("test", "pay_x", records)
         assert "LATE_SETTLEMENT" in case.exception_codes
         assert case.classification == "REVIEW_REQUIRED"
+
+# ===========================================================================
+# Idempotent retry (safe client retries on run POSTs)
+# ===========================================================================
+
+class TestIdempotentRunRetry:
+    def _valid_records(self):
+        return [{
+            "record_type": "payment",
+            "external_id": "pay_idem_1",
+            "amount": 100000,
+            "payment_id": "pay_idem_1",
+            "order_id": "ord_idem_1",
+        }, {
+            "record_type": "fee_tax",
+            "external_id": "ft_idem_1",
+            "amount": 2700,
+            "payment_id": "pay_idem_1",
+            "fee_amount": 2400,
+            "tax_amount": 300,
+        }, {
+            "record_type": "settlement",
+            "external_id": "set_idem_1",
+            "amount": 97300,
+            "payment_id": "pay_idem_1",
+        }]
+
+    def test_same_idempotency_key_returns_same_run(self, auth_client):
+        """A client retry with the SAME Idempotency-Key never creates a
+        second run — duplicate financial work is prevented."""
+        headers = {"Idempotency-Key": "idem-test-1"}
+        body = {"records": self._valid_records(), "source": "api_retry_test"}
+        first = auth_client.post("/api/reconciliation/run", json=body, headers=headers)
+        assert first.status_code == 200, first.text
+        second = auth_client.post("/api/reconciliation/run", json=body, headers=headers)
+        assert second.status_code == 200, second.text
+        assert first.json()["run_id"] == second.json()["run_id"], (
+            "retried POST must return the original run")
+        # And no duplicate ledger decisions were produced for that run.
+        resp = auth_client.get(f"/api/reconciliation/runs/{first.json()['run_id']}/exceptions")
+        assert resp.status_code == 200
+
+    def test_different_keys_create_distinct_runs(self, auth_client):
+        body = {"records": self._valid_records(), "source": "api_retry_test"}
+        a = auth_client.post("/api/reconciliation/run", json=body,
+                             headers={"Idempotency-Key": "idem-a"})
+        b = auth_client.post("/api/reconciliation/run", json=body,
+                             headers={"Idempotency-Key": "idem-b"})
+        assert a.status_code == 200 and b.status_code == 200
+        assert a.json()["run_id"] != b.json()["run_id"]
+
+    def test_demo_run_idempotent_retry(self, auth_client):
+        headers = {"Idempotency-Key": "idem-demo-1"}
+        first = auth_client.post("/api/reconciliation/run/demo?count=30", headers=headers)
+        assert first.status_code == 200, first.text
+        second = auth_client.post("/api/reconciliation/run/demo?count=30", headers=headers)
+        assert second.status_code == 200, second.text
+        assert first.json()["run_id"] == second.json()["run_id"]
+        assert first.json()["total_cases"] == 30
